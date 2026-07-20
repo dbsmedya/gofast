@@ -1,0 +1,13 @@
+# Keep the build context lean — none of these are needed to compile the binary.
+.git
+.gitignore
+bin
+data
+exports
+*.tar
+**/*.duckdb
+perf_tests
+docs
+README.md
+LICENSE
+NOTICE

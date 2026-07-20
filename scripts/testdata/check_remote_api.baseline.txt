@@ -1,0 +1,78 @@
+[1m
+dbs-vector Remote API — Compatibility Check[0m
+  Base URL : [96mhttp://localhost:8080/api/v1[0m
+  API key  : [96mtest-t…[0m
+  Timeout  : 30s
+
+[1m[96m── 1. Health  GET /health[0m[0m
+  [92m✓[0m [[92mPASS[0m] health_returns_200
+  [92m✓[0m [[92mPASS[0m] health_status_is_ok
+  [92m✓[0m [[92mPASS[0m] health_has_version_string
+  [92m✓[0m [[92mPASS[0m] health_has_databases_list
+  [92m✓[0m [[92mPASS[0m] health_no_auth_required
+
+[1m[96m── 2. Authentication[0m[0m
+  [92m✓[0m [[92mPASS[0m] auth_no_token_returns_401
+  [92m✓[0m [[92mPASS[0m] auth_no_token_error_is_invalid_token
+  [92m✓[0m [[92mPASS[0m] auth_wrong_token_returns_401
+
+[1m[96m── 3. GET /sql/queries — structure[0m[0m
+  [92m✓[0m [[92mPASS[0m] queries_returns_200
+  [92m✓[0m [[92mPASS[0m] queries_content_type_json
+  [92m✓[0m [[92mPASS[0m] queries_x_request_id_header
+  [92m✓[0m [[92mPASS[0m] queries_has_data_array
+  [92m✓[0m [[92mPASS[0m] queries_has_has_more_bool
+  [92m✓[0m [[92mPASS[0m] queries_has_total_count_numeric
+  [92m✓[0m [[92mPASS[0m] queries_record_has_required_fields
+  [92m✓[0m [[92mPASS[0m] queries_required_fields_non_null
+  [92m✓[0m [[92mPASS[0m] queries_tables_is_list_never_null
+  [92m✓[0m [[92mPASS[0m] queries_latest_ts_iso8601
+  [92m✓[0m [[92mPASS[0m] queries_text_not_empty_string
+  [92m✓[0m [[92mPASS[0m] queries_id_non_empty_string
+  [92m✓[0m [[92mPASS[0m] queries_execution_time_ms_numeric
+  [92m✓[0m [[92mPASS[0m] queries_calls_is_int
+
+[1m[96m── 4. GET /sql/queries — pagination[0m[0m
+  [92m✓[0m [[92mPASS[0m] queries_limit_param_respected
+  [92m✓[0m [[92mPASS[0m] queries_next_cursor_present_when_has_more
+  [92m✓[0m [[92mPASS[0m] queries_page2_returns_200
+  [92m✓[0m [[92mPASS[0m] queries_no_duplicate_ids_across_pages
+
+[1m[96m── 5. GET /sql/queries — filters[0m[0m
+  [92m✓[0m [[92mPASS[0m] queries_min_execution_ms_filter_honored
+  [92m✓[0m [[92mPASS[0m] queries_since_future_returns_empty
+  [92m✓[0m [[92mPASS[0m] queries_database_filter_returns_matching_source
+
+[1m[96m── 6. GET /sql/databases[0m[0m
+  [92m✓[0m [[92mPASS[0m] databases_returns_200
+  [92m✓[0m [[92mPASS[0m] databases_has_databases_list
+  [92m✓[0m [[92mPASS[0m] databases_consistent_with_health
+
+[1m[96m── 7. POST /sql/execute — happy path[0m[0m
+  [92m✓[0m [[92mPASS[0m] execute_select_returns_200
+  [92m✓[0m [[92mPASS[0m] execute_has_columns
+  [92m✓[0m [[92mPASS[0m] execute_has_rows
+  [92m✓[0m [[92mPASS[0m] execute_has_row_count
+  [92m✓[0m [[92mPASS[0m] execute_has_truncated_bool
+  [92m✓[0m [[92mPASS[0m] execute_has_execution_time_ms
+  [92m✓[0m [[92mPASS[0m] execute_row_count_matches_len_rows
+  [92m✓[0m [[92mPASS[0m] execute_rows_parallel_to_columns
+
+[1m[96m── 8. POST /sql/execute — safety enforcement[0m[0m
+  [92m✓[0m [[92mPASS[0m] execute_rejects_insert_with_422
+  [92m✓[0m [[92mPASS[0m] execute_insert_error_code_unsafe_query
+  [92m✓[0m [[92mPASS[0m] execute_rejects_update_with_422
+  [92m✓[0m [[92mPASS[0m] execute_update_error_code_unsafe_query
+  [92m✓[0m [[92mPASS[0m] execute_rejects_delete_with_422
+  [92m✓[0m [[92mPASS[0m] execute_delete_error_code_unsafe_query
+  [92m✓[0m [[92mPASS[0m] execute_rejects_drop_with_422
+  [92m✓[0m [[92mPASS[0m] execute_drop_error_code_unsafe_query
+  [92m✓[0m [[92mPASS[0m] execute_multi_statement_rejected
+
+[1m[96m── 9. Error envelope[0m[0m
+  [92m✓[0m [[92mPASS[0m] error_envelope_has_error_field
+  [92m✓[0m [[92mPASS[0m] error_envelope_has_message_field
+
+────────────────────────────────────────────────────────
+[1mResults[0m
+  [92m51/51 passed[0m   [91m0 failed[0m   [93m0 skipped[0m

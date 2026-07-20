@@ -1,0 +1,27 @@
+{
+  "data": [
+    {
+      "calls": 1,
+      "execution_time_ms": 5000,
+      "host": "batch1",
+      "id": "945052ADCBFE6486",
+      "latest_ts": "",
+      "lock_time_sec": 0.001,
+      "raw_query": "SELECT country, COUNT(*) FROM events GROUP BY country",
+      "rows_examined": 2000000,
+      "rows_sent": 1000,
+      "source": "analytics",
+      "source_hosts": [
+        "analytics-slow"
+      ],
+      "tables": [
+        "analytics.events"
+      ],
+      "text": "select country, count(*) from events group by country",
+      "user": "etl"
+    }
+  ],
+  "has_more": true,
+  "next_cursor": "eyJleGVjdXRpb25fdGltZV9tcyI6NTAwMCwiaWQiOiI5NDUwNTJBRENCRkU2NDg2In0=",
+  "total_count": 3
+}

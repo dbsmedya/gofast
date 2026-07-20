@@ -1,0 +1,47 @@
+{
+  "data": [
+    {
+      "calls": 2,
+      "execution_time_ms": 5600,
+      "host": "web1",
+      "id": "13980AA1698C3634",
+      "latest_ts": "",
+      "lock_time_sec": 0.0001,
+      "raw_query": "SELECT * FROM orders WHERE customer_id = 7 AND status = 'paid'",
+      "rows_examined": 100000,
+      "rows_sent": 1,
+      "source": "shop",
+      "source_hosts": [
+        "shop-slow"
+      ],
+      "tables": [
+        "shop.orders"
+      ],
+      "text": "select * from orders where customer_id = ? and status = ?",
+      "user": "app"
+    },
+    {
+      "calls": 1,
+      "execution_time_ms": 900,
+      "host": "web2",
+      "id": "77D5CE87BDEB0083",
+      "latest_ts": "",
+      "lock_time_sec": 0,
+      "raw_query": "SELECT id, total FROM invoices WHERE created_at > '2026-01-01'",
+      "rows_examined": 5,
+      "rows_sent": 5,
+      "source": "shop",
+      "source_hosts": [
+        "shop-slow"
+      ],
+      "tables": [
+        "shop.invoices"
+      ],
+      "text": "select id, total from invoices where created_at > ?",
+      "user": "reporting"
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null,
+  "total_count": 2
+}

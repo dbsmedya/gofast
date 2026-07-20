@@ -1,0 +1,6 @@
+{
+  "databases": [
+    "analytics",
+    "shop"
+  ]
+}

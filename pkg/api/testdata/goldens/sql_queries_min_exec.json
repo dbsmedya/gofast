@@ -1,0 +1,47 @@
+{
+  "data": [
+    {
+      "calls": 2,
+      "execution_time_ms": 5600,
+      "host": "web1",
+      "id": "13980AA1698C3634",
+      "latest_ts": "",
+      "lock_time_sec": 0.0001,
+      "raw_query": "SELECT * FROM orders WHERE customer_id = 7 AND status = 'paid'",
+      "rows_examined": 100000,
+      "rows_sent": 1,
+      "source": "shop",
+      "source_hosts": [
+        "shop-slow"
+      ],
+      "tables": [
+        "shop.orders"
+      ],
+      "text": "select * from orders where customer_id = ? and status = ?",
+      "user": "app"
+    },
+    {
+      "calls": 1,
+      "execution_time_ms": 5000,
+      "host": "batch1",
+      "id": "945052ADCBFE6486",
+      "latest_ts": "",
+      "lock_time_sec": 0.001,
+      "raw_query": "SELECT country, COUNT(*) FROM events GROUP BY country",
+      "rows_examined": 2000000,
+      "rows_sent": 1000,
+      "source": "analytics",
+      "source_hosts": [
+        "analytics-slow"
+      ],
+      "tables": [
+        "analytics.events"
+      ],
+      "text": "select country, count(*) from events group by country",
+      "user": "etl"
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null,
+  "total_count": 2
+}

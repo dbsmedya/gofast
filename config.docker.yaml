@@ -1,0 +1,17 @@
+# GoFast container runtime configuration
+
+duckdb:
+  path: "/app/data/gofast.duckdb"
+
+parser:
+  slow_log_dir: "/app/logs"
+  batch_size: 1000
+  file_patterns:
+    - "*slow*"
+    - "*.log"
+    - "*mysql*"
+  workers: 4
+
+api:
+  host: "0.0.0.0"
+  port: 8080

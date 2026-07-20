@@ -1,0 +1,27 @@
+{
+  "data": [
+    {
+      "calls": 2,
+      "execution_time_ms": 5600,
+      "host": "web1",
+      "id": "13980AA1698C3634",
+      "latest_ts": "",
+      "lock_time_sec": 0.0001,
+      "raw_query": "SELECT * FROM orders WHERE customer_id = 7 AND status = 'paid'",
+      "rows_examined": 100000,
+      "rows_sent": 1,
+      "source": "shop",
+      "source_hosts": [
+        "shop-slow"
+      ],
+      "tables": [
+        "shop.orders"
+      ],
+      "text": "select * from orders where customer_id = ? and status = ?",
+      "user": "app"
+    }
+  ],
+  "has_more": true,
+  "next_cursor": "eyJleGVjdXRpb25fdGltZV9tcyI6NTYwMCwiaWQiOiIxMzk4MEFBMTY5OEMzNjM0In0=",
+  "total_count": 3
+}

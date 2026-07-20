@@ -1,0 +1,34 @@
+# GoFast Configuration
+# MySQL Slow Log Parser Configuration
+
+# DuckDB database settings
+duckdb:
+  # Path to the DuckDB database file
+  path: "./data/gofast.duckdb"
+
+# Parser settings
+parser:
+  # Directory containing MySQL slow log files
+  slow_log_dir: "./logs"
+  
+  # Batch size for inserting records (default: 1000)
+  batch_size: 1000
+
+  # File name globs (OR, case-insensitive). Default reproduces historical discovery.
+  # Env: GOFAST_PARSER_FILE_PATTERNS (comma-separated)
+  file_patterns:
+    - "*slow*"
+    - "*.log"
+    - "*mysql*"
+
+  # Concurrent file workers (default min(4, NumCPU); 1 = sequential)
+  # Env: GOFAST_PARSER_WORKERS
+  workers: 4
+
+# API server settings
+api:
+  # Host to bind the API server
+  host: "0.0.0.0"
+  
+  # Port to listen on
+  port: 8080

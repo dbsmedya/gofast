@@ -1,0 +1,21 @@
+# Conservative starter linters for gofast-cli (Phase 1 CI).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+  exclusions:
+    presets:
+      - std-error-handling

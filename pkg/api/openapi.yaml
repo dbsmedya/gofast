@@ -1,0 +1,351 @@
+openapi: "3.0.3"
+info:
+  title: GoFast Machine API
+  description: >-
+    Machine-tier REST API served by pkg/api.NewRouter / RegisterMachineRoutes:
+    a health check and read-only SQL access over parsed MySQL slow-query
+    data. This document covers ONLY the machine tier (no dashboard/UI
+    routes). info.version is the frozen machine-API contract version
+    (api.ContractVersion), independent of the software release tag.
+  version: "1.0.0"
+
+paths:
+  /api/v1/health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      description: >-
+        Always answers 200. `databases` is best-effort: it is empty if the
+        store is temporarily unavailable (e.g. mid-parse), never an error.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/sql/databases:
+    get:
+      operationId: listDatabases
+      summary: List available database names
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabasesResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/sql/queries:
+    get:
+      operationId: listQueries
+      summary: List aggregated slow-query fingerprints (paginated)
+      description: >-
+        Aggregates raw slow-log rows by fingerprint over a time window
+        (default: last 15 days), ordered by cumulative execution_time_ms
+        descending, with keyset pagination via `cursor`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 200
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: min_execution_ms
+          in: query
+          schema:
+            type: number
+            default: 0
+        - name: database
+          in: query
+          schema:
+            type: string
+        - name: known_hashes
+          in: query
+          description: Comma-separated, lowercase SHA-256[:16] hashes to exclude.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueriesResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/sql/execute:
+    post:
+      operationId: executeQuery
+      summary: Execute a custom, single, read-only SELECT query
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecuteRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecuteResponse"
+        "400":
+          description: Invalid request body or parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "408":
+          description: Query execution timed out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Query rejected (not a single read-only SELECT/WITH)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/openapi.json:
+    get:
+      operationId: getOpenAPISpec
+      summary: This OpenAPI document, as JSON
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, version, databases]
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+        databases:
+          type: array
+          nullable: false
+          items:
+            type: string
+
+    DatabasesResponse:
+      type: object
+      required: [databases]
+      properties:
+        databases:
+          type: array
+          nullable: false
+          items:
+            type: string
+
+    QueryRecord:
+      type: object
+      description: One aggregated slow-query fingerprint.
+      required:
+        - id
+        - text
+        - raw_query
+        - source
+        - execution_time_ms
+        - calls
+        - tables
+        - latest_ts
+        - user
+        - host
+        - rows_sent
+        - rows_examined
+        - lock_time_sec
+        - source_hosts
+      properties:
+        id:
+          type: string
+          description: Stable fingerprint id (hex), sha256(normalized text)[:16].
+        text:
+          type: string
+          description: Normalized SQL (params replaced with `?`).
+        raw_query:
+          type: string
+          description: One raw sample of the original SQL text.
+        source:
+          type: string
+          description: Database/schema name the query ran against.
+        execution_time_ms:
+          type: number
+          description: Cumulative execution time across all calls, in ms.
+        calls:
+          type: integer
+        tables:
+          type: array
+          nullable: false
+          description: Schema-qualified table names; always an array, never null.
+          items:
+            type: string
+        latest_ts:
+          type: string
+          description: RFC3339 UTC timestamp of the most recent occurrence.
+        user:
+          type: string
+          nullable: true
+        host:
+          type: string
+          nullable: true
+        rows_sent:
+          type: integer
+          nullable: true
+        rows_examined:
+          type: integer
+          nullable: true
+        lock_time_sec:
+          type: number
+          nullable: true
+        source_hosts:
+          type: array
+          nullable: false
+          description: >-
+            Distinct source-log hostnames; always an array, never null.
+          items:
+            type: string
+
+    QueriesResponse:
+      type: object
+      required: [data, has_more, next_cursor, total_count]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryRecord"
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque base64 keyset cursor; null when has_more is false.
+        total_count:
+          type: integer
+
+    ExecuteRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: A single read-only SELECT (or SELECT-containing WITH) statement.
+        database:
+          type: string
+        timeout_ms:
+          type: integer
+          default: 10000
+
+    ExecuteResponse:
+      type: object
+      required: [columns, rows, row_count, truncated, execution_time_ms]
+      properties:
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: array
+            items: {}
+        row_count:
+          type: integer
+        truncated:
+          type: boolean
+        execution_time_ms:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      description: The uniform error envelope returned by every non-2xx response.
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: A stable machine-readable error code (e.g. invalid_token).
+        message:
+          type: string
+          description: A human-readable message.
+        request_id:
+          type: string
