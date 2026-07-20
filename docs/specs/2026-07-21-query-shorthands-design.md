@@ -67,8 +67,10 @@ break the `--json | jq` raw-SQL use case. They remain untouched for the machine 
 | Neither | Print command usage/help |
 
 "Shorthand flags" = any of `--filter`, `--group-by`, `--order-by`, `--asc`,
-`--limit`, `--offset`. (`--json`/`--markdown` are output flags and are allowed on
-*both* paths; they do not by themselves select the structured path.)
+`--limit`, `--offset`, or a **preset flag** (`--top-queries`,
+`--impacting-queries`, `--locking-queries` — see §5.1). (`--json`/`--markdown`
+are output flags and are allowed on *both* paths; they do not by themselves
+select the structured path.)
 
 The legacy path keeps its exact current output (the `Columns:/Rows:` text block)
 when no output-format flag is given, preserving README examples and any scraping.
@@ -84,9 +86,15 @@ when no output-format flag is given, preserving README examples and any scraping
 --offset N              default 0
 --json                  output as array-of-objects (full columns)    see §6
 --markdown              output as report-style markdown              see §6
+
+--top-queries           preset: group by fingerprint, order by calls desc       see §5.1
+--impacting-queries     preset: group by fingerprint, order by impact_score desc see §5.1
+--locking-queries       preset: lock contention grouped by user                 see §5.1
 ```
 
-`--json` and `--markdown` are mutually exclusive; giving both is an error.
+`--json` and `--markdown` are mutually exclusive; giving both is an error. The
+three preset flags are boolean (named exactly as requested) and are mutually
+exclusive with each other and with manual `--group-by`/`--order-by` (see §5.1).
 
 ### 3. `--filter` grammar
 
@@ -178,18 +186,23 @@ Unknown `--order-by` → error listing valid names.
 
 ```sql
 SELECT <group_col> AS "group",
-       COUNT(*)                    AS calls,
-       ROUND(SUM(query_time_sec), 2) AS total_time,
-       ROUND(AVG(query_time_sec), 2) AS avg_time,
-       ROUND(MAX(query_time_sec), 2) AS max_time,
-       ROUND(AVG(rows_examined), 0)  AS avg_rows,
-       ANY_VALUE(sample_sql)         AS sample_sql
+       COUNT(*)                       AS calls,
+       ROUND(SUM(query_time_sec), 2)  AS total_time,
+       ROUND(SUM(lock_time_sec), 2)   AS total_lock_time,
+       ROUND(AVG(query_time_sec), 2)  AS avg_time,
+       ROUND(MAX(query_time_sec), 2)  AS max_time,
+       ROUND(AVG(rows_examined), 0)   AS avg_rows,
+       ANY_VALUE(sample_sql)          AS sample_sql
 FROM slow_logs_with_source
 <where>
 GROUP BY <group_col>
 ORDER BY <order_col> <dir>
 LIMIT ? OFFSET ?
 ```
+
+`total_lock_time = SUM(lock_time_sec)` is part of the base digest shape, so it
+appears in every grouped result (`--group-by X` and `--top-queries`).
+`--impacting-queries` is the one report that drops it (replaced by `impact_score`).
 
 For `--group-by table` the same aggregate template runs over the unnested array —
 the `FROM`/`GROUP BY`/`SELECT` group column become (exact DuckDB `UNNEST`-in-`FROM`
@@ -208,10 +221,43 @@ The `<where>` clause is still `RecordFilter.BuildWhere()`'s parameterized output
 (applied before/independently of the UNNEST), so a `table=…` filter combined with
 `--group-by table` works.
 
-`--order-by` in grouped mode ∈ {`total_time` (default), `count`, `avg_time`,
-`max_time`, `avg_rows`}, referenced by alias. Default `total_time desc`. `--asc`
-flips. Unknown → error listing valid aggregate names. `sample_sql` is full (not
-truncated) so `--json | jq` yields real SQL.
+`--order-by` in grouped mode ∈ {`total_time` (default), `count`, `total_lock_time`,
+`avg_time`, `max_time`, `avg_rows`}, referenced by alias. Default `total_time desc`.
+`--asc` flips. Unknown → error listing valid aggregate names. `sample_sql` is full
+(not truncated) so `--json | jq` yields real SQL.
+
+### 5.1 Preset reports
+
+Three boolean preset flags bundle a fixed group-by + order-by (+ shape) over the
+same grouped machinery above. Each preset **honors** `--filter`, `--limit`,
+`--offset`, `--json`/`--markdown`, but is **mutually exclusive** with (a) the
+other presets, (b) manual `--group-by`/`--order-by`/`--asc`, and (c) positional
+SQL — any such combination is an error. `--limit` defaults still apply (50).
+
+**`--top-queries`** — most frequent fingerprints:
+- `GROUP BY fingerprint_id`, `ORDER BY calls DESC`.
+- Columns: the base digest shape (`group, calls, total_time, total_lock_time,
+  avg_time, max_time, avg_rows, sample_sql`).
+
+**`--impacting-queries`** — frequency-weighted load:
+- `GROUP BY fingerprint_id`, `ORDER BY impact_score DESC`.
+- `impact_score = ROUND(COUNT(*) * SUM(query_time_sec), 2)` (calls × total_time).
+- Columns: the digest shape with `total_lock_time` **replaced by** `impact_score`
+  (`group, calls, total_time, impact_score, avg_time, max_time, avg_rows, sample_sql`).
+- `impact_score` is a **relative rank**, not a share/percentage of total — no
+  normalization is applied.
+
+**`--locking-queries`** — lock contention by user:
+- `GROUP BY user`, `ORDER BY total_lock_time DESC`.
+- Columns: `group (user), total_lock_time = ROUND(SUM(lock_time_sec), 2),
+  fingerprints = COUNT(DISTINCT fingerprint_id), calls = COUNT(*)`.
+- No `sample_sql` (a per-user group spans many distinct queries, so one sample
+  isn't meaningful).
+
+All three go through the generic renderers (§6): new columns `impact_score` /
+`total_lock_time` / `fingerprints` render as ordinary fields; `sample_sql` (top /
+impacting) is fenced. The `<where>` clause is `RecordFilter.BuildWhere()`'s
+parameterized output, identical to §5, so filters compose with every preset.
 
 ### 6. Output formats
 
@@ -263,8 +309,9 @@ SELECT * FROM orders WHERE customer_id = 8831 ORDER BY created_at DESC
 ````
 
 Grouped mode uses the same shape: heading = `a1b2c3d4 · 1240 calls · total 372.05s`,
-a small field table for `avg_time`/`max_time`/`avg_rows`, then the representative
-`sample_sql` fenced.
+a small field table for the remaining aggregates (`total_lock_time`, `avg_time`,
+`max_time`, `avg_rows`, plus `impact_score`/`fingerprints` when present), then the
+representative `sample_sql` fenced (omitted for `--locking-queries`).
 
 The heading is a best-effort convenience: the renderer picks a couple of
 well-known columns for the `### …` line when present (`id`/`group`, `query_time_sec`,
@@ -283,13 +330,16 @@ silent `id`-fallback, which stays as-is inside `pkg`):
   numeric/timestamp value, missing operator).
 - Unknown `--group-by` key.
 - Unknown `--order-by` name (mode-appropriate list).
+- More than one preset flag given.
+- A preset flag combined with `--group-by`, `--order-by`, `--asc`, or positional SQL.
 
 ### 8. File layout
 
 Extract the query command out of the now-bloated `cmd/cli/main.go`:
 
 - `cmd/cli/query.go` — `queryCmd()`, flag definitions, path dispatch, `--filter`
-  parsing → `storage.RecordFilter`, ungrouped/grouped SQL builders + CLI allow-lists.
+  parsing → `storage.RecordFilter`, ungrouped/grouped/preset SQL builders + CLI
+  allow-lists (presets resolve to a fixed group/order/shape before building SQL).
 - `cmd/cli/render.go` — the three renderers: legacy text (moved verbatim), JSON
   (array-of-objects), markdown (report style). All take `*models.ReportResult`.
 - `cmd/cli/main.go` — keeps wiring (`rootCmd.AddCommand(queryCmd())`) only.
@@ -309,13 +359,19 @@ build a temp DuckDB store, seed rows, exercise the command):
    `IN`; numeric `>`/`<`; `ts` range; unknown key → error; unsupported op → error.
 4. **Ungrouped:** filters applied; full (un-truncated) `sample_sql` returned;
    `--order-by`/`--asc` honored; `--limit`/`--offset` honored.
-5. **Grouped:** aggregate values correct (`calls`, `total_time`, `avg_time`,
-   `max_time`, `avg_rows`); grouped `--order-by` allow-list; unknown → error.
-   `--group-by table`: a row touching N tables lands in N groups; a NULL/empty
-   `tables` row appears in no table-group.
-6. **Renderers:** JSON is a valid array-of-objects with full SQL; markdown fences
+5. **Grouped:** aggregate values correct (`calls`, `total_time`, `total_lock_time`,
+   `avg_time`, `max_time`, `avg_rows`); grouped `--order-by` allow-list; unknown →
+   error. `--group-by table`: a row touching N tables lands in N groups; a
+   NULL/empty `tables` row appears in no table-group.
+6. **Presets:** `--top-queries` orders by `calls` desc with the digest shape;
+   `--impacting-queries` yields `impact_score = calls*total_time`, ordered desc,
+   with `total_lock_time` absent and `impact_score` present; `--locking-queries`
+   groups by user with `total_lock_time`/`fingerprints`/`calls`. Filters compose
+   with a preset. Preset+preset, preset+`--group-by`/`--order-by`, and
+   preset+positional SQL each → error.
+7. **Renderers:** JSON is a valid array-of-objects with full SQL; markdown fences
    `*_sql` columns; both work on a legacy raw-SQL result too.
-7. **SQLi safety:** a `--filter` value containing SQL metacharacters
+8. **SQLi safety:** a `--filter` value containing SQL metacharacters
    (e.g. `--filter "db=x'; DROP TABLE slow_logs;--"`) is bound as a `?` value and
    matches nothing / does not execute.
 
