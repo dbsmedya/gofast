@@ -15,6 +15,10 @@ A Go module shipping the parser/storage/fingerprint libraries (`pkg/`) and two e
 3. **The stable contract is the REST machine API + `config.yaml` schema**, specified by the served OpenAPI (`pkg/api/openapi.yaml`, served at `/api/v1/openapi.json`). `scripts/run-contract-check.sh` must stay green.
 4. **No secrets; `gitleaks` must pass.**
 
+## Scope
+
+The machine API surface (`/api/v1/*`) is stable; new endpoints are not planned in the near term. Favor bug fixes, hardening, and internal (`internal/`, `cmd/`) work over expanding the public `pkg/` surface.
+
 ## Layout
 
 - `cmd/cli/` — the `gofast-cli` binary (parse/stats/query/serve).
