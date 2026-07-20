@@ -46,10 +46,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    goos: linux,   goarch: amd64, archive: tar.gz }
-          - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, archive: tar.gz }
-          - { os: windows-latest,   goos: windows, goarch: amd64, archive: zip }
-          - { os: macos-latest,     goos: darwin,  goarch: arm64, archive: tar.gz }
+          - { os: ubuntu-latest,    goos: linux,  goarch: amd64 }
+          - { os: ubuntu-24.04-arm, goos: linux,  goarch: arm64 }
+          - { os: macos-latest,     goos: darwin, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,15 +59,8 @@ jobs:
           go-version: "1.25.12"
           cache-dependency-path: go.sum
 
-      # DuckDB (cgo) needs a C/C++ toolchain. Linux and macOS runners already
-      # ship one; Windows needs the UCRT64 mingw gcc go-duckdb builds against.
-      - name: Set up UCRT64 GCC (Windows)
-        if: matrix.goos == 'windows'
-        shell: pwsh
-        run: |
-          C:\msys64\usr\bin\pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc
-          "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-
+      # DuckDB is linked via cgo; the Linux and macOS runners already ship the
+      # C/C++ toolchain it needs.
       - name: Resolve tag into the environment
         shell: bash
         run: echo "TAG=${{ needs.create-release.outputs.tag }}" >> "$GITHUB_ENV"
@@ -80,10 +72,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          bin="gofast-cli"
-          [ "${{ matrix.goos }}" = "windows" ] && bin="gofast-cli.exe"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "dist/${bin}" ./cmd/cli
+          go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "dist/gofast-cli" ./cmd/cli
 
       - name: Package
         id: pkg
@@ -91,15 +81,10 @@ jobs:
         run: |
           name="gofast-cli_${TAG}_${{ matrix.goos }}_${{ matrix.goarch }}"
           mkdir -p "staging/${name}"
-          cp dist/gofast-cli* "staging/${name}/"
+          cp dist/gofast-cli "staging/${name}/"
           cp LICENSE NOTICE README.md "staging/${name}/"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            asset="${name}.zip"
-            ( cd staging && 7z a -tzip "../${asset}" "${name}" >/dev/null )
-          else
-            asset="${name}.tar.gz"
-            tar -C staging -czf "${asset}" "${name}"
-          fi
+          asset="${name}.tar.gz"
+          tar -C staging -czf "${asset}" "${name}"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "${asset}" > "${asset}.sha256"
           else
