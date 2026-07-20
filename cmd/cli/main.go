@@ -23,6 +23,10 @@ var (
 	slowLogDir   string
 	duckDBPath   string
 	configLoaded *config.Config
+
+	// version is stamped at build time via -ldflags "-X main.version=<tag>";
+	// it stays "dev" for plain `go build`.
+	version = "dev"
 )
 
 func main() {
@@ -262,15 +266,15 @@ func versionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version information",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("GoFast CLI v1.0.0")
+			fmt.Printf("GoFast CLI %s\n", version)
 		},
 	}
 }
 
 // fixedStoreProvider wraps a single, never-swapped *storage.Storage so it
 // satisfies api.StoreProvider. `serve` never parses (and so never swaps the
-// store), but the RWMutex + nil check make this match the interface exactly
-// as the enterprise StorageManager will in Phase 2.
+// store); the RWMutex + nil check keep it a faithful StoreProvider for a
+// store that could, in principle, be swapped under a write lock.
 type fixedStoreProvider struct {
 	mu sync.RWMutex
 	s  *storage.Storage
