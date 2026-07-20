@@ -128,17 +128,26 @@ Users must quote it: `--filter "query_time > 2"` (or write `--filter query_time>
 
 Allowed group keys → grouped SQL column (CLI-local allow-list):
 
-| `--group-by` value | GROUP BY column |
+| `--group-by` value | GROUP BY target |
 |---|---|
 | `fingerprint` | `fingerprint_id` |
 | `user` | `user` |
 | `db` | `db` |
 | `host` | `host` |
 | `source_host` | `source_host` |
+| `table` | each element of the `tables` array, via `UNNEST` — see §5 |
 
 Only one group column (a plain string flag; last wins if passed twice). Unknown
-value → error listing valid keys. Grouping by `table` is out of scope for v1 (it
-requires `UNNEST` of the array column); can be added later, additively.
+value → error listing valid keys.
+
+`table` grouping expands the `tables VARCHAR[]` array with `UNNEST`: a query that
+touches N tables contributes one row to each of its N table-groups. This is the
+expected per-table report semantics (each table's stats include every query that
+touched it), but it means `calls`/`total_time` summed *across* table-groups can
+exceed the total query count — by design, not a bug. Rows with a NULL/empty
+`tables` array do not appear in a `--group-by table` report. Group keys are the
+table names exactly as stored in the array (parser-dependent; may include the
+quoted form).
 
 ### 5. Two structured modes
 
@@ -181,6 +190,23 @@ GROUP BY <group_col>
 ORDER BY <order_col> <dir>
 LIMIT ? OFFSET ?
 ```
+
+For `--group-by table` the same aggregate template runs over the unnested array —
+the `FROM`/`GROUP BY`/`SELECT` group column become (exact DuckDB `UNNEST`-in-`FROM`
+syntax confirmed at implementation):
+
+```sql
+SELECT t AS "group", COUNT(*) AS calls, ... , ANY_VALUE(sample_sql) AS sample_sql
+FROM slow_logs_with_source, UNNEST(tables) AS u(t)
+<where>
+GROUP BY t
+ORDER BY <order_col> <dir>
+LIMIT ? OFFSET ?
+```
+
+The `<where>` clause is still `RecordFilter.BuildWhere()`'s parameterized output
+(applied before/independently of the UNNEST), so a `table=…` filter combined with
+`--group-by table` works.
 
 `--order-by` in grouped mode ∈ {`total_time` (default), `count`, `avg_time`,
 `max_time`, `avg_rows`}, referenced by alias. Default `total_time desc`. `--asc`
@@ -285,6 +311,8 @@ build a temp DuckDB store, seed rows, exercise the command):
    `--order-by`/`--asc` honored; `--limit`/`--offset` honored.
 5. **Grouped:** aggregate values correct (`calls`, `total_time`, `avg_time`,
    `max_time`, `avg_rows`); grouped `--order-by` allow-list; unknown → error.
+   `--group-by table`: a row touching N tables lands in N groups; a NULL/empty
+   `tables` row appears in no table-group.
 6. **Renderers:** JSON is a valid array-of-objects with full SQL; markdown fences
    `*_sql` columns; both work on a legacy raw-SQL result too.
 7. **SQLi safety:** a `--filter` value containing SQL metacharacters
@@ -293,10 +321,11 @@ build a temp DuckDB store, seed rows, exercise the command):
 
 ## Out of scope (v1)
 
-- `--group-by table` (needs `UNNEST`).
 - Additional operators beyond what `RecordFilter` models (`!=`, `>=`/`<=` on
   numeric columns, `<` on `rows_examined`, etc.).
 - Multi-column grouping.
 - A compact markdown *table* mode (report style only for now).
+- Normalizing quoted vs unquoted table names in `--group-by table` output
+  (keys are shown as stored in the `tables` array).
 
 These are all additive and can follow later without breaking this design.
