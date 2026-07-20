@@ -1,0 +1,119 @@
+name: release
+
+# Builds the gofast-cli binary for each supported platform and attaches the
+# archives to the GitHub Release for the tag. DuckDB is linked via cgo, so each
+# target is built natively on its own-architecture runner (cross-compiling cgo
+# is unreliable) rather than with GOOS/GOARCH cross builds.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build binaries for and attach to its release (e.g. v0.9.2)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: meta
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Ensure a release exists (keep existing notes)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; keeping its notes."
+          else
+            gh release create "$tag" --title "$tag" --generate-notes
+          fi
+
+  build:
+    needs: create-release
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    goos: linux,   goarch: amd64, archive: tar.gz }
+          - { os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, archive: tar.gz }
+          - { os: windows-latest,   goos: windows, goarch: amd64, archive: zip }
+          - { os: macos-latest,     goos: darwin,  goarch: arm64, archive: tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.12"
+          cache-dependency-path: go.sum
+
+      # DuckDB (cgo) needs a C/C++ toolchain. Linux and macOS runners already
+      # ship one; Windows needs the UCRT64 mingw gcc go-duckdb builds against.
+      - name: Set up UCRT64 GCC (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          C:\msys64\usr\bin\pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc
+          "C:\msys64\ucrt64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Resolve tag into the environment
+        shell: bash
+        run: echo "TAG=${{ needs.create-release.outputs.tag }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          bin="gofast-cli"
+          [ "${{ matrix.goos }}" = "windows" ] && bin="gofast-cli.exe"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "dist/${bin}" ./cmd/cli
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          name="gofast-cli_${TAG}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          mkdir -p "staging/${name}"
+          cp dist/gofast-cli* "staging/${name}/"
+          cp LICENSE NOTICE README.md "staging/${name}/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            asset="${name}.zip"
+            ( cd staging && 7z a -tzip "../${asset}" "${name}" >/dev/null )
+          else
+            asset="${name}.tar.gz"
+            tar -C staging -czf "${asset}" "${name}"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${asset}" > "${asset}.sha256"
+          else
+            shasum -a 256 "${asset}" > "${asset}.sha256"
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "$TAG" \
+            "${{ steps.pkg.outputs.asset }}" \
+            "${{ steps.pkg.outputs.asset }}.sha256" \
+            --clobber
