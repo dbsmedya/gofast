@@ -18,13 +18,35 @@ type Storage struct {
 	readOnly  bool
 }
 
+// duckdbSecurityOpts hardens the DuckDB engine on every connection, applied as
+// DSN options per DuckDB's security guide
+// (https://duckdb.org/docs/operations_manual/securing_duckdb/overview).
+// gofast never reaches the filesystem or network from SQL — ingestion uses the
+// Go appender API and no extensions are loaded — so these cost nothing and
+// close an exfiltration path that access_mode=read_only does NOT: without them,
+// DuckDB SQL can read and write local files (read_csv, COPY ... TO) and install
+// extensions even when the store is opened read-only.
+//
+//   - enable_external_access=false blocks read_csv/read_parquet/COPY/ATTACH/INSTALL.
+//   - allow_community_extensions=false blocks third-party extension installs.
+//   - lock_configuration=true (kept LAST) makes the above tamper-proof for the
+//     database instance: no later SET can re-enable them. go-duckdb records all
+//     DSN options into one config object applied atomically at open, so the lock
+//     never blocks its sibling options here.
+//
+// disabled_filesystems='LocalFileSystem' is deliberately NOT included: it cannot
+// be passed via the DSN and it breaks the database's own file writes/WAL and
+// temp-spill for large queries. enable_external_access=false already blocks the
+// SQL file functions, which is the actual threat.
+const duckdbSecurityOpts = "allow_community_extensions=false&enable_external_access=false&lock_configuration=true"
+
 // NewStorage creates a new Storage instance
 // When readOnly is true, opens the database in read-only mode (no writes allowed)
 // When readOnly is false, opens with read-write access and initializes schema
 func NewStorage(dsn string, readOnly bool) (*Storage, error) {
-	connectionDSN := dsn
+	connectionDSN := dsn + "?" + duckdbSecurityOpts
 	if readOnly {
-		connectionDSN = dsn + "?access_mode=read_only"
+		connectionDSN = dsn + "?access_mode=read_only&" + duckdbSecurityOpts
 	}
 
 	connector, err := duckdb.NewConnector(connectionDSN, nil)
