@@ -29,7 +29,10 @@ var (
 	version = "dev"
 )
 
-func main() {
+// newRootCmd builds the full command tree. Extracted from main() so tests can
+// execute the real tree — flag parsing, config loading, and output routing
+// included — instead of reaching past cobra into the helpers.
+func newRootCmd() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:   "gofast-cli",
 		Short: "GoFast MySQL Slow Log Parser CLI",
@@ -63,11 +66,15 @@ func main() {
 	rootCmd.AddCommand(parseCmd())
 	rootCmd.AddCommand(statsCmd())
 	rootCmd.AddCommand(queryCmd())
+	rootCmd.AddCommand(digestCmd())
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(serveCmd())
 
-	// Execute
-	if err := rootCmd.Execute(); err != nil {
+	return rootCmd
+}
+
+func main() {
+	if err := newRootCmd().Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
