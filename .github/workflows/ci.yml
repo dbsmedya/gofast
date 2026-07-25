@@ -75,6 +75,20 @@ jobs:
           fi
           echo "deadcode: all functions reachable"
 
+  pkg-locked:
+    name: pkg-locked
+    # Scoped to the digest work: proves THIS feature stayed out of pkg/.
+    # Delete this job when the feature merges -- it is not standing policy;
+    # CLAUDE.md treats pkg/ changes as legitimate versioned events.
+    if: startsWith(github.head_ref, 'feat/digest')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assert pkg/ is unchanged
+        run: ./scripts/check-pkg-locked.sh "origin/${{ github.base_ref || 'main' }}"
+
   contract:
     name: contract
     runs-on: ubuntu-latest
