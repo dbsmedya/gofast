@@ -4,9 +4,12 @@ Guidance for Claude Code working in **gofast** (`github.com/dbsmedya/gofast`) �
 
 ## What this repo is
 
-A Go module shipping the parser/storage/fingerprint libraries (`pkg/`) and two entry points in `cmd/cli`:
+A Go module shipping the parser/storage/fingerprint libraries (`pkg/`) and these entry points in `cmd/cli`:
 - `gofast-cli parse` / `stats` / `query` — CLI over the parser + DuckDB store.
+- `gofast-cli digest` — pt-query-digest-compatible report (engine in `internal/digest`).
 - `gofast-cli serve` — the read-only machine API (`pkg/api`, routes under `/api/v1/`).
+
+**File-placement conventions are in [AGENTS.md](AGENTS.md)** — read it before creating files. In short: `.ayder/` is internal scratch and must never be tracked; `docs/` is public documentation only; superpowers specs/plans go in `.ayder/superpowers_<YYYYMMDD>/`.
 
 ## Hard rules
 
@@ -23,5 +26,6 @@ The machine API surface (`/api/v1/*`) is stable; new endpoints are not planned i
 
 - `cmd/cli/` — the `gofast-cli` binary (parse/stats/query/serve).
 - `pkg/` — the public library + machine-API router (`pkg/api`).
-- `internal/` — non-public support (contract-test harness).
-- `docs/` — `README_API.md` (machine REST API), `README_PARSER.md` (parser internals).
+- `internal/` — non-public support (contract-test harness, `digest` report engine).
+- `docs/` — **public documentation only**: `README_DIGEST.md` (the `digest` report), `README_SQL.md` (schema + example SQL), `README_API.md` (machine REST API), `README_PARSER.md` (parser internals).
+- `.ayder/` — internal scratch; **never tracked**. Superpowers specs/plans, release notes, planning docs.

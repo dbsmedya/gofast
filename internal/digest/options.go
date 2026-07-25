@@ -1,7 +1,7 @@
 // Package digest builds pt-query-digest-compatible reports over the DuckDB
 // slow-log store. It is deliberately internal: gofastd does not consume it, and
 // keeping it unexported avoids freezing a public contract at v1.0.0. See
-// docs/specs/2026-07-25-pt-query-digest-design.md.
+// docs/README_DIGEST.md.
 package digest
 
 import (
