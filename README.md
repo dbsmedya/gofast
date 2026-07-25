@@ -200,6 +200,30 @@ unique_fingerprints: 456
 ./bin/gofast-cli query "SELECT user, COUNT(*) FROM slow_logs GROUP BY user"
 ```
 
+#### `digest` - pt-query-digest-Compatible Report
+
+Aggregates stored slow queries into `pt-query-digest`'s report shape — a ranked
+profile table plus a per-class detail section. Output is markdown unless
+`--json` is passed, in which case stdout carries only JSON and can be piped
+straight into `jq`.
+
+```bash
+# The ten fingerprints consuming the most total execution time
+./bin/gofast-cli digest --group-by fingerprint --order-by Query_time:sum --limit 10
+
+# One fingerprint in detail
+./bin/gofast-cli digest --filter "fingerprint = FDEA8D2993C9CAF3"
+
+# Last week's worst tables by rows examined, as JSON
+./bin/gofast-cli digest --group-by tables --order-by Rows_examined:sum \
+  --since 7d --json | jq '.classes[] | {id, calls}'
+```
+
+Quote any filter containing `>` or `<`, or the shell will redirect output.
+
+See [docs/README_DIGEST.md](docs/README_DIGEST.md) for the full flag reference,
+the report columns, and known limits.
+
 #### `version` - Show Version
 
 ```bash
