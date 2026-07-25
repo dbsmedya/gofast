@@ -522,6 +522,37 @@ func TestParseFiltersTablesAlias(t *testing.T) {
 	}
 }
 
+func TestParseFiltersRejectsMultiValueTable(t *testing.T) {
+	// RecordFilter.BuildWhere() ANDs each table predicate, so a comma list
+	// would mean "touches BOTH" while the same syntax on user means "either".
+	// Rather than ship two opposite meanings for one syntax, reject it.
+	cases := [][]string{
+		{"table = orders,customers"},          // comma list
+		{"table = orders", "table = customers"}, // repeated flag
+		{"tables = a,b"},                       // via the alias
+		{"table = orders", "tables = customers"}, // mixed spellings
+	}
+	for _, c := range cases {
+		_, err := ParseFilters(c)
+		if err == nil {
+			t.Fatalf("ParseFilters(%v): expected an error", c)
+		}
+		if !contains(err.Error(), "--group-by tables") {
+			t.Errorf("ParseFilters(%v) error %q should point at --group-by tables", c, err)
+		}
+	}
+}
+
+func TestParseFiltersRejectsEmptyValues(t *testing.T) {
+	// A comma-only value previously passed the non-empty check and then
+	// produced no values at all, silently running unfiltered.
+	for _, in := range []string{"user =", "user = ,", "user = , ,", "db ="} {
+		if _, err := ParseFilters([]string{in}); err == nil {
+			t.Errorf("ParseFilters(%q): expected an error, got a silent no-op filter", in)
+		}
+	}
+}
+
 func TestParseFiltersErrors(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -662,9 +693,15 @@ var filterKeyList = []string{
 }
 
 // ParseFilters turns repeated "KEY OP VALUE" strings into a RecordFilter.
-// Filters are AND-combined. String keys accumulate into IN-lists (repeat the
-// flag or use a comma list); numeric keys overwrite, because RecordFilter holds
-// a single bound per comparison.
+// Filters are AND-combined. user/host/db/source_host accumulate into IN-lists
+// (repeat the flag or use a comma list) and mean "either"; numeric keys
+// overwrite, because RecordFilter holds a single bound per comparison.
+//
+// `table` is restricted to ONE value. BuildWhere() renders each table value as
+// its own list_contains predicate and joins predicates with AND
+// (pkg/storage/records.go:104), so a comma list would mean "touches both" while
+// the identical syntax on `user` means "either". Shipping two opposite meanings
+// for one syntax is worse than rejecting the ambiguous case.
 //
 // Every value ends up as a bound `?` via RecordFilter.BuildWhere(), so no user
 // input reaches SQL text.
@@ -678,6 +715,11 @@ func ParseFilters(exprs []string) (storage.RecordFilter, error) {
 		if err := applyFilter(&f, key, op, val, raw); err != nil {
 			return f, err
 		}
+	}
+	if len(f.Tables) > 1 {
+		return f, fmt.Errorf(
+			"--filter table accepts a single value (got %d); "+
+				"use --group-by tables for a per-table breakdown", len(f.Tables))
 	}
 	return f, nil
 }
@@ -729,7 +771,13 @@ func applyFilter(f *storage.RecordFilter, key, op, val, raw string) error {
 		if op != "=" {
 			return fmt.Errorf("--filter %q: %s supports only '='", raw, key)
 		}
-		*target = append(*target, splitList(val)...)
+		vals := splitList(val)
+		if len(vals) == 0 {
+			// "user = ," trims to nothing; without this the filter would
+			// silently vanish and the command would run unfiltered.
+			return fmt.Errorf("--filter %q: no values given for %s", raw, key)
+		}
+		*target = append(*target, vals...)
 		return nil
 	}
 
@@ -1288,7 +1336,7 @@ git commit -m "feat(digest): distill queries into the Item column"
 
 ---
 
-### Task 5: SQL builders for the three passes
+### Task 5: SQL builders for the four passes
 
 **Files:**
 - Create: `internal/digest/sql.go`
@@ -1296,7 +1344,7 @@ git commit -m "feat(digest): distill queries into the Item column"
 
 **Interfaces:**
 - Consumes: `Options`, `GroupKey.column()`, `GroupKey.isTables()`, `Attr.column()`, `unnestAlias` (Task 1).
-- Produces: `buildGlobalsSQL(storage.RecordFilter) (string, []any)`, `buildRankSQL(Options) (string, []any)`, `buildStatsSQL(Options, []string) (string, []any)`, the ranking-layout constants `colRankGroup`, `colRankCalls`, `colRankValue`, and the stats-layout constants `statsPerAttr`, `colStatsGroup`, `colStatsCalls`, `colStatsQueryTime`, `colStatsVarSamp`, `colStatsLockTime`, `colStatsRowsSent`, `colStatsRowsExamined`, `colStatsSampleSQL`, `colStatsSanitizedSQL`, `colStatsTables`, `statsWidth`.
+- Produces: `buildGlobalsSQL(storage.RecordFilter) (string, []any)`, `buildRankSQL(Options) (string, []any)`, `buildStatsSQL(Options, []string) (string, []any)`, `buildRepresentativeSQL(Options, []string) (string, []any)`, `keyedWhere(Options, []string) (string, []any)`, the ranking-layout constants `colRankGroup`/`colRankCalls`/`colRankValue`, the stats-layout constants `statsPerAttr`/`colStatsGroup`/`colStatsCalls`/`colStatsQueryTime`/`colStatsVarSamp`/`colStatsLockTime`/`colStatsRowsSent`/`colStatsRowsExamined`/`statsWidth`, and the representative-layout constants `colRepGroup`/`colRepSampleSQL`/`colRepSanitizedSQL`/`colRepTables`/`repWidth`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1356,8 +1404,10 @@ func TestBuildRankSQLCoalescesGroupColumn(t *testing.T) {
 	if !strings.Contains(q, "COALESCE(db, '')") {
 		t.Errorf("group column is not coalesced:\n%s", q)
 	}
-	if !strings.Contains(q, "ORDER BY rank_val DESC") {
-		t.Errorf("expected descending order:\n%s", q)
+	// The secondary key is required: without it a tie at the LIMIT boundary
+	// decides which classes appear at all, nondeterministically.
+	if !strings.Contains(q, "ORDER BY rank_val DESC, grp ASC") {
+		t.Errorf("expected a stable secondary sort:\n%s", q)
 	}
 	if !strings.Contains(q, "LIMIT ?") {
 		t.Errorf("limit must be bound, not interpolated:\n%s", q)
@@ -1459,6 +1509,55 @@ func TestBuildStatsSQLHasEveryStatistic(t *testing.T) {
 	}
 }
 
+func TestBuildStatsSQLCarriesNoRepresentativeColumns(t *testing.T) {
+	// Representative fields moved to pass 4; three independent ANY_VALUE calls
+	// could otherwise mix rows.
+	q, _ := buildStatsSQL(DefaultOptions(), []string{"AAAA"})
+	if strings.Contains(q, "ANY_VALUE") {
+		t.Errorf("stats SQL must not use ANY_VALUE:\n%s", q)
+	}
+	for _, col := range []string{"sample_sql", "sanitized_sql"} {
+		if strings.Contains(q, col) {
+			t.Errorf("stats SQL must not select %s:\n%s", col, q)
+		}
+	}
+}
+
+func TestBuildRepresentativeSQLPicksOneRowPerGroup(t *testing.T) {
+	q, args := buildRepresentativeSQL(DefaultOptions(), []string{"AAAA", "BBBB"})
+
+	// All three fields share one ordering expression, so they resolve to the
+	// same row.
+	for _, want := range []string{
+		"arg_max(sample_sql, query_time_sec)",
+		"arg_max(sanitized_sql, query_time_sec)",
+		"arg_max(tables, query_time_sec)",
+	} {
+		if !strings.Contains(q, want) {
+			t.Errorf("representative SQL missing %q:\n%s", want, q)
+		}
+	}
+	// Most-frequent fingerprint wins, with a deterministic tie-break.
+	if !strings.Contains(q, "ORDER BY fp_calls DESC, fingerprint_id ASC") {
+		t.Errorf("expected a deterministic fingerprint ranking:\n%s", q)
+	}
+	if !strings.Contains(q, "PARTITION BY grp") {
+		t.Errorf("expected per-group partitioning:\n%s", q)
+	}
+	if !strings.Contains(q, "WHERE rn = 1") {
+		t.Errorf("expected exactly one row per group:\n%s", q)
+	}
+	if !strings.Contains(q, "GROUP BY grp, fingerprint_id") {
+		t.Errorf("expected the per-fingerprint grain:\n%s", q)
+	}
+	if len(args) != 2 || args[0] != "AAAA" {
+		t.Errorf("args = %v, want the bound group keys", args)
+	}
+	if strings.Contains(q, "AAAA") {
+		t.Errorf("group key was interpolated into SQL:\n%s", q)
+	}
+}
+
 func TestStatsColumnIndicesAreConsistent(t *testing.T) {
 	// The scan in run.go indexes by position; these constants must not drift.
 	if colStatsGroup != 0 || colStatsCalls != 1 || colStatsQueryTime != 2 {
@@ -1476,11 +1575,11 @@ func TestStatsColumnIndicesAreConsistent(t *testing.T) {
 	if colStatsRowsExamined != colStatsRowsSent+statsPerAttr {
 		t.Errorf("rows_examined index %d is wrong", colStatsRowsExamined)
 	}
-	if colStatsSampleSQL != colStatsRowsExamined+statsPerAttr {
-		t.Errorf("sample_sql index %d is wrong", colStatsSampleSQL)
+	if statsWidth != colStatsRowsExamined+statsPerAttr {
+		t.Errorf("statsWidth %d does not match the last attribute block", statsWidth)
 	}
-	if statsWidth != colStatsTables+1 {
-		t.Errorf("statsWidth %d does not match the last index %d", statsWidth, colStatsTables)
+	if repWidth != colRepTables+1 {
+		t.Errorf("repWidth %d does not match the last representative index", repWidth)
 	}
 }
 ```
@@ -1526,15 +1625,21 @@ const (
 
 	colStatsGroup        = 0
 	colStatsCalls        = 1
-	colStatsQueryTime    = 2                                    // .. +6
-	colStatsVarSamp      = colStatsQueryTime + statsPerAttr     // 9
-	colStatsLockTime     = colStatsVarSamp + 1                  // 10 .. +6
-	colStatsRowsSent     = colStatsLockTime + statsPerAttr      // 17 .. +6
-	colStatsRowsExamined = colStatsRowsSent + statsPerAttr      // 24 .. +6
-	colStatsSampleSQL    = colStatsRowsExamined + statsPerAttr  // 31
-	colStatsSanitizedSQL = colStatsSampleSQL + 1                // 32
-	colStatsTables       = colStatsSanitizedSQL + 1             // 33
-	statsWidth           = colStatsTables + 1                   // 34
+	colStatsQueryTime    = 2                                   // .. +6
+	colStatsVarSamp      = colStatsQueryTime + statsPerAttr    // 9
+	colStatsLockTime     = colStatsVarSamp + 1                 // 10 .. +6
+	colStatsRowsSent     = colStatsLockTime + statsPerAttr     // 17 .. +6
+	colStatsRowsExamined = colStatsRowsSent + statsPerAttr     // 24 .. +6
+	statsWidth           = colStatsRowsExamined + statsPerAttr // 31
+)
+
+// Pass-4 (representative row) result layout.
+const (
+	colRepGroup        = 0
+	colRepSampleSQL    = 1
+	colRepSanitizedSQL = 2
+	colRepTables       = 3
+	repWidth           = 4
 )
 
 // groupExpr renders the grouping expression for o.
@@ -1598,7 +1703,7 @@ func buildRankSQL(o Options) (string, []any) {
 		FROM %s
 		%s
 		GROUP BY grp
-		ORDER BY rank_val DESC
+		ORDER BY rank_val DESC, grp ASC
 		LIMIT ?`, grp, aggExpr(o.OrderBy), fromClause(o), where)
 	args = append(args, o.Limit)
 	return q, args
@@ -1617,14 +1722,12 @@ func statFragment(col string) string {
 		       CAST(quantile_cont(%[1]s, 0.5) AS DOUBLE)`, col)
 }
 
-// buildStatsSQL is pass 3: the full statistics matrix, restricted to the group
-// keys pass 2 returned. keys are bound as placeholders.
-func buildStatsSQL(o Options, keys []string) (string, []any) {
+// keyedWhere appends a bound `grp IN (...)` predicate to the filter's WHERE
+// clause, shared by passes 3 and 4.
+func keyedWhere(o Options, keys []string) (string, []any) {
 	where, args := o.Filter.BuildWhere()
-	grp := groupExpr(o)
-
 	ph := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
-	cond := fmt.Sprintf("%s IN (%s)", grp, ph)
+	cond := fmt.Sprintf("%s IN (%s)", groupExpr(o), ph)
 	if where == "" {
 		where = "WHERE " + cond
 	} else {
@@ -1633,7 +1736,18 @@ func buildStatsSQL(o Options, keys []string) (string, []any) {
 	for _, k := range keys {
 		args = append(args, k)
 	}
+	return where, args
+}
 
+// buildStatsSQL is pass 3: the full statistics matrix, restricted to the group
+// keys pass 2 returned. keys are bound as placeholders.
+//
+// It carries no representative columns. Three independent ANY_VALUE calls have
+// no guarantee of agreeing on a row, which would let Item be distilled from one
+// row's sanitized_sql and another row's tables; pass 4 selects one row
+// explicitly instead.
+func buildStatsSQL(o Options, keys []string) (string, []any) {
+	where, args := keyedWhere(o, keys)
 	q := fmt.Sprintf(`
 		SELECT %s AS grp,
 		       CAST(COUNT(*) AS DOUBLE),
@@ -1641,20 +1755,52 @@ func buildStatsSQL(o Options, keys []string) (string, []any) {
 		       CAST(var_samp(query_time_sec) AS DOUBLE),
 		       %s,
 		       %s,
-		       %s,
-		       ANY_VALUE(sample_sql),
-		       ANY_VALUE(sanitized_sql),
-		       ANY_VALUE(tables)
+		       %s
 		FROM %s
 		%s
 		GROUP BY grp`,
-		grp,
+		groupExpr(o),
 		statFragment("query_time_sec"),
 		statFragment("lock_time_sec"),
 		statFragment("rows_sent"),
 		statFragment("rows_examined"),
 		fromClause(o),
 		where)
+	return q, args
+}
+
+// buildRepresentativeSQL is pass 4: one representative row per group.
+//
+// The rule is: within each group rank fingerprints by call count (ties broken on
+// fingerprint_id), take the winner — the query the group runs most often — and
+// from its rows take the slowest. All three fields share one arg_max ordering
+// expression, so they provably come from the same row. Verified against DuckDB
+// for both VARCHAR and VARCHAR[].
+//
+// For --group-by fingerprint the ranking step is a no-op, so this degenerates to
+// "the slowest instance of this query".
+func buildRepresentativeSQL(o Options, keys []string) (string, []any) {
+	where, args := keyedWhere(o, keys)
+	q := fmt.Sprintf(`
+		WITH per_fp AS (
+		  SELECT %s AS grp,
+		         fingerprint_id,
+		         COUNT(*) AS fp_calls,
+		         arg_max(sample_sql, query_time_sec)    AS sample_sql,
+		         arg_max(sanitized_sql, query_time_sec) AS sanitized_sql,
+		         arg_max(tables, query_time_sec)        AS tbls
+		  FROM %s
+		  %s
+		  GROUP BY grp, fingerprint_id
+		),
+		ranked AS (
+		  SELECT *, ROW_NUMBER() OVER (
+		             PARTITION BY grp
+		             ORDER BY fp_calls DESC, fingerprint_id ASC) AS rn
+		  FROM per_fp
+		)
+		SELECT grp, sample_sql, sanitized_sql, tbls FROM ranked WHERE rn = 1`,
+		groupExpr(o), fromClause(o), where)
 	return q, args
 }
 ```
@@ -1673,7 +1819,7 @@ git commit -m "feat(digest): SQL builders for the globals, ranking, and stats pa
 
 ---
 
-### Task 6: `Run` — execute the three passes
+### Task 6: `Run` — execute the four passes
 
 **Files:**
 - Create: `internal/digest/run.go`
@@ -1682,7 +1828,7 @@ git commit -m "feat(digest): SQL builders for the globals, ranking, and stats pa
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–5.
-- Produces: `Querier` interface, `Run(ctx context.Context, q Querier, o Options) (*Report, error)`.
+- Produces: `Querier` interface, `Run(ctx context.Context, q Querier, o Options) (*Report, error)`, and the unexported `representative` struct plus `runGlobals`/`runRanking`/`runStats`/`runRepresentative`.
 
 - [ ] **Step 1: Write the seeding helper and the failing test**
 
@@ -1754,6 +1900,9 @@ func seedStore(t *testing.T, entries []*models.SlowLogEntry) *storage.Storage {
 //	                                 var 2.0, V/M = 2.0/2.0 = 1.0
 //	BBBB: query_time 5.0          -> sum 5.0, stddev/var NULL -> 0, V/M 0
 //	totals: calls 3, exec 9.0, lock 0.9, rows_sent 40, rows_examined 900
+//
+// AAAA's representative row is its slowest (the 3.0s one), so Item is
+// "SELECT orders customers" and sample_sql is "SELECT * FROM orders WHERE id = 2".
 func fixtureEntries(now time.Time) []*models.SlowLogEntry {
 	return []*models.SlowLogEntry{
 		{
@@ -1799,6 +1948,7 @@ package digest
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -1853,11 +2003,14 @@ func TestRunGroupsByFingerprintWithExactStatistics(t *testing.T) {
 	approx(t, "AAAA V/M", aaaa.VM, 1.0)
 	approx(t, "AAAA response time pct", aaaa.ResponseTimePct, 4.0/9.0*100)
 
-	if aaaa.Item != "SELECT orders" && aaaa.Item != "SELECT orders customers" {
-		t.Errorf("AAAA item = %q, want a distilled SELECT over orders", aaaa.Item)
+	// The representative rule makes these exact, not merely non-empty: AAAA is
+	// its own most-frequent fingerprint, and its slowest row is the 3.0s one,
+	// which touches both tables.
+	if aaaa.Item != "SELECT orders customers" {
+		t.Errorf("AAAA item = %q, want \"SELECT orders customers\" (the slowest row's tables)", aaaa.Item)
 	}
-	if aaaa.SampleSQL == "" {
-		t.Error("AAAA sample_sql is empty")
+	if aaaa.SampleSQL != "SELECT * FROM orders WHERE id = 2" {
+		t.Errorf("AAAA sample_sql = %q, want the 3.0s row's sample", aaaa.SampleSQL)
 	}
 }
 
@@ -2104,6 +2257,98 @@ func TestRunFilterValuesAreBoundNotInterpolated(t *testing.T) {
 	}
 }
 
+func TestRunRepresentativeComesFromMostFrequentFingerprint(t *testing.T) {
+	// One user runs a rare-but-slow query once and a frequent query three
+	// times. The representative must describe the FREQUENT one, and its
+	// sample must be that fingerprint's slowest instance -- not the slow
+	// outlier from the other fingerprint.
+	now := time.Now()
+	entries := []*models.SlowLogEntry{
+		{FingerprintID: "RARE", SanitizedSQL: "DELETE FROM audit WHERE id = ?",
+			SampleSQL: "RARE_SAMPLE", User: "app", Host: "h", DB: "d",
+			QueryTimeSec: 99, LockTimeSec: 0.1, RowsSent: 1, RowsExamined: 1,
+			TS: now, Tables: []string{"audit"}, EventOffset: 1, EventHash: "r1"},
+		{FingerprintID: "FREQ", SanitizedSQL: "SELECT * FROM orders WHERE id = ?",
+			SampleSQL: "FREQ_FAST", User: "app", Host: "h", DB: "d",
+			QueryTimeSec: 1, LockTimeSec: 0.1, RowsSent: 1, RowsExamined: 1,
+			TS: now, Tables: []string{"orders"}, EventOffset: 2, EventHash: "f1"},
+		{FingerprintID: "FREQ", SanitizedSQL: "SELECT * FROM orders WHERE id = ?",
+			SampleSQL: "FREQ_MID", User: "app", Host: "h", DB: "d",
+			QueryTimeSec: 2, LockTimeSec: 0.1, RowsSent: 1, RowsExamined: 1,
+			TS: now, Tables: []string{"orders"}, EventOffset: 3, EventHash: "f2"},
+		{FingerprintID: "FREQ", SanitizedSQL: "SELECT * FROM orders WHERE id = ?",
+			SampleSQL: "FREQ_SLOWEST", User: "app", Host: "h", DB: "d",
+			QueryTimeSec: 3, LockTimeSec: 0.1, RowsSent: 1, RowsExamined: 1,
+			TS: now, Tables: []string{"orders"}, EventOffset: 4, EventHash: "f3"},
+	}
+	store := seedStore(t, entries)
+
+	o := DefaultOptions()
+	o.GroupBy = GroupUser
+	rep, err := Run(context.Background(), store, o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rep.Classes) != 1 {
+		t.Fatalf("classes = %d, want 1", len(rep.Classes))
+	}
+	c := rep.Classes[0]
+
+	// FREQ has 3 calls vs RARE's 1, so FREQ wins despite RARE being far slower.
+	if c.Item != "SELECT orders" {
+		t.Errorf("Item = %q, want \"SELECT orders\" (the most frequent query)", c.Item)
+	}
+	// Within FREQ, the slowest instance supplies the sample.
+	if c.SampleSQL != "FREQ_SLOWEST" {
+		t.Errorf("SampleSQL = %q, want FREQ_SLOWEST", c.SampleSQL)
+	}
+	// A cross-row mixture would show up as the audit table with a FREQ sample.
+	if strings.Contains(c.Item, "audit") {
+		t.Errorf("Item mixed rows from another fingerprint: %q", c.Item)
+	}
+}
+
+func TestRunTieBreakIsDeterministic(t *testing.T) {
+	// Two fingerprints with identical total query time. Without the grp ASC
+	// secondary sort, --limit 1 could return either across runs.
+	now := time.Now()
+	entries := []*models.SlowLogEntry{
+		{FingerprintID: "AAAA", SanitizedSQL: "SELECT 1", SampleSQL: "a",
+			User: "u", Host: "h", DB: "d", QueryTimeSec: 2, LockTimeSec: 0,
+			RowsSent: 1, RowsExamined: 1, TS: now, Tables: []string{"t"},
+			EventOffset: 1, EventHash: "a1"},
+		{FingerprintID: "BBBB", SanitizedSQL: "SELECT 2", SampleSQL: "b",
+			User: "u", Host: "h", DB: "d", QueryTimeSec: 2, LockTimeSec: 0,
+			RowsSent: 1, RowsExamined: 1, TS: now, Tables: []string{"t"},
+			EventOffset: 2, EventHash: "b1"},
+	}
+	store := seedStore(t, entries)
+
+	o := DefaultOptions()
+	o.Limit = 1
+	var first string
+	for i := 0; i < 5; i++ {
+		rep, err := Run(context.Background(), store, o)
+		if err != nil {
+			t.Fatalf("Run %d: %v", i, err)
+		}
+		if len(rep.Classes) != 1 {
+			t.Fatalf("run %d: classes = %d, want 1", i, len(rep.Classes))
+		}
+		if i == 0 {
+			first = rep.Classes[0].ID
+			continue
+		}
+		if rep.Classes[0].ID != first {
+			t.Fatalf("tie broke differently across runs: %q then %q", first, rep.Classes[0].ID)
+		}
+	}
+	// grp ASC means the lexicographically smaller key wins a tie.
+	if first != "AAAA" {
+		t.Errorf("tie winner = %q, want AAAA (grp ASC)", first)
+	}
+}
+
 func TestRunValidatesOptions(t *testing.T) {
 	store := seedStore(t, fixtureEntries(time.Now()))
 	o := DefaultOptions()
@@ -2161,10 +2406,11 @@ type Querier interface {
 	Query(ctx context.Context, query string, args ...interface{}) (*models.ReportResult, error)
 }
 
-// Run executes the digest in three passes: population totals, a cheap ranking
-// pass that narrows to o.Limit groups, then the full statistics matrix for just
-// those groups. Splitting the work this way keeps percentile and standard
-// deviation computation off every group in a large store.
+// Run executes the digest in four passes: population totals, a cheap ranking
+// pass that narrows to o.Limit groups, then the full statistics matrix and the
+// representative-row selection for just those groups. Splitting the work this
+// way keeps percentile and standard deviation computation off every group in a
+// large store.
 func Run(ctx context.Context, q Querier, o Options) (*Report, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
@@ -2200,6 +2446,12 @@ func Run(ctx context.Context, q Querier, o Options) (*Report, error) {
 		return nil, err
 	}
 
+	// Pass 4 — one representative row per group, for Item and sample_sql.
+	repByKey, err := runRepresentative(ctx, q, o, keys)
+	if err != nil {
+		return nil, err
+	}
+
 	for i, key := range keys {
 		cls, ok := statsByKey[key]
 		if !ok {
@@ -2209,9 +2461,41 @@ func Run(ctx context.Context, q Querier, o Options) (*Report, error) {
 			return nil, fmt.Errorf("internal: group %q ranked but has no statistics", key)
 		}
 		cls.Rank = i + 1
+		if r, ok := repByKey[key]; ok {
+			cls.SampleSQL = r.sampleSQL
+			cls.Item = Distill(r.sanitizedSQL, r.tables)
+		}
 		rep.Classes = append(rep.Classes, cls)
 	}
 	return rep, nil
+}
+
+// representative is one group's chosen row.
+type representative struct {
+	sampleSQL    string
+	sanitizedSQL string
+	tables       []string
+}
+
+// runRepresentative returns the representative row per group key.
+func runRepresentative(ctx context.Context, q Querier, o Options, keys []string) (map[string]representative, error) {
+	sql, args := buildRepresentativeSQL(o, keys)
+	res, err := q.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("digest representative rows: %w", err)
+	}
+	out := make(map[string]representative, len(res.Rows))
+	for _, row := range res.Rows {
+		if len(row) < repWidth {
+			return nil, fmt.Errorf("internal: representative row has %d columns, want %d", len(row), repWidth)
+		}
+		out[toStr(row[colRepGroup])] = representative{
+			sampleSQL:    toStr(row[colRepSampleSQL]),
+			sanitizedSQL: toStr(row[colRepSanitizedSQL]),
+			tables:       toStrs(row[colRepTables]),
+		}
+	}
+	return out, nil
 }
 
 func runGlobals(ctx context.Context, q Querier, o Options) (Totals, error) {
@@ -2265,11 +2549,10 @@ func runStats(ctx context.Context, q Querier, o Options, keys []string, totals T
 		calls := toInt64(row[colStatsCalls])
 		exec := readStats(row, colStatsQueryTime, totals.ExecTimeSec)
 
+		// SampleSQL and Item are filled in by Run from pass 4.
 		cls := Class{
-			ID:        toStr(row[colStatsGroup]),
-			Calls:     calls,
-			SampleSQL: toStr(row[colStatsSampleSQL]),
-			Item:      Distill(toStr(row[colStatsSanitizedSQL]), toStrs(row[colStatsTables])),
+			ID:    toStr(row[colStatsGroup]),
+			Calls: calls,
 			Attributes: map[string]Stats{
 				AttrKeyExecTime:     exec,
 				AttrKeyLockTime:     readStats(row, colStatsLockTime, totals.LockTimeSec),
@@ -2648,12 +2931,12 @@ git commit -m "feat(digest): markdown renderer with pt-query-digest layout"
 
 **Files:**
 - Create: `cmd/cli/digest.go`
-- Modify: `cmd/cli/main.go:66` (add one `rootCmd.AddCommand(digestCmd())` line)
+- Modify: `cmd/cli/main.go:32-74` (extract `newRootCmd()` out of `main()`, register `digestCmd()`)
 - Test: `cmd/cli/digest_test.go`
 
 **Interfaces:**
 - Consumes: `digest.Run`, `digest.Options`, `digest.ParseGroupKey`, `digest.ParseOrderBy`, `digest.ParseFilters`, `digest.ApplyTimeBounds`, `renderMarkdown`.
-- Produces: `digestCmd() *cobra.Command`, `buildDigestOptions(digestFlags, time.Time) (digest.Options, error)`, `runDigest(*config.Config, digest.Options, bool, io.Writer) error`.
+- Produces: `digestCmd() *cobra.Command`, `buildDigestOptions(digestFlags, time.Time) (digest.Options, error)`, `runDigest(*config.Config, digest.Options, bool, io.Writer) error`, `newRootCmd() *cobra.Command`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2856,6 +3139,79 @@ func TestDigestCmdIsRegisteredWithSilencedUsage(t *testing.T) {
 	}
 }
 
+func TestRootCmdRegistersDigest(t *testing.T) {
+	// Registration itself must be tested: a command that is never added to the
+	// root is unreachable no matter how well its internals work.
+	var found bool
+	for _, c := range newRootCmd().Commands() {
+		if c.Name() == "digest" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("digest is not registered on the root command")
+	}
+}
+
+func TestRootCmdPreservesExistingSubcommands(t *testing.T) {
+	// Extracting newRootCmd() out of main() must not drop anything.
+	want := map[string]bool{"parse": false, "stats": false, "query": false,
+		"serve": false, "version": false, "digest": false}
+	for _, c := range newRootCmd().Commands() {
+		if _, ok := want[c.Name()]; ok {
+			want[c.Name()] = true
+		}
+	}
+	for name, present := range want {
+		if !present {
+			t.Errorf("subcommand %q is missing from the root command", name)
+		}
+	}
+}
+
+func TestDigestEndToEndThroughRootCommand(t *testing.T) {
+	// Exercises the real command tree: flag parsing, PersistentPreRunE config
+	// loading, and output routing -- none of which calling runDigest directly
+	// would cover.
+	path := seedCLIStore(t)
+	var stdout, stderr bytes.Buffer
+
+	root := newRootCmd()
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"digest", "--duck-db-path", path, "--json", "--limit", "1"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute: %v (stderr: %s)", err, stderr.String())
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not pure JSON: %v\n%s", err, stdout.String())
+	}
+	if got["group_by"] != "fingerprint" {
+		t.Errorf("group_by = %v", got["group_by"])
+	}
+}
+
+func TestDigestEndToEndInvalidFlagKeepsStdoutClean(t *testing.T) {
+	path := seedCLIStore(t)
+	var stdout, stderr bytes.Buffer
+
+	root := newRootCmd()
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"digest", "--duck-db-path", path, "--json", "--order-by", "bogus"})
+
+	if err := root.Execute(); err == nil {
+		t.Fatal("expected an error for an invalid --order-by")
+	}
+	// Usage and diagnostics must never land on stdout in --json mode.
+	if stdout.Len() != 0 {
+		t.Errorf("stdout must stay empty on error, got: %s", stdout.String())
+	}
+}
+
 // digestDefaults and digestFilterFor are small test helpers.
 func digestDefaults() digest.Options { return digest.DefaultOptions() }
 
@@ -2883,7 +3239,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/dbsmedya/gofast/internal/digest"
@@ -3006,7 +3361,10 @@ be piped straight into jq.`,
 			if err != nil {
 				return err
 			}
-			return runDigest(configLoaded, o, f.json, os.Stdout)
+			// OutOrStdout, not os.Stdout: writing to the process stream
+			// directly would make the command untestable. SilenceUsage keeps
+			// cobra's own output off this writer on the error path.
+			return runDigest(configLoaded, o, f.json, cmd.OutOrStdout())
 		},
 	}
 
@@ -3025,15 +3383,69 @@ be piped straight into jq.`,
 }
 ```
 
-- [ ] **Step 4: Register the command**
+- [ ] **Step 4: Extract `newRootCmd()` and register the command**
 
-In `cmd/cli/main.go`, add one line to the command list around line 66:
+`main()` currently builds the root command inline, so tests cannot execute the
+real command tree. Move that construction into `newRootCmd()` verbatim — no
+behavior changes, only relocation — and register `digestCmd()`.
+
+In `cmd/cli/main.go`, replace the body of `main()` (lines 32–74) with:
 
 ```go
+// newRootCmd builds the full command tree. Extracted from main() so tests can
+// execute the real tree — flag parsing, config loading, and output routing
+// included — instead of reaching past cobra into the helpers.
+func newRootCmd() *cobra.Command {
+	rootCmd := &cobra.Command{
+		Use:   "gofast-cli",
+		Short: "GoFast MySQL Slow Log Parser CLI",
+		Long:  `A CLI tool for parsing MySQL slow logs and storing them in DuckDB`,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Load config before each command
+			cfg, err := config.Load(cfgFile)
+			if err != nil {
+				return fmt.Errorf("failed to load config: %w", err)
+			}
+
+			// Override with CLI flags if provided
+			if slowLogDir != "" {
+				cfg.Parser.SlowLogDir = slowLogDir
+			}
+			if duckDBPath != "" {
+				cfg.DuckDB.Path = duckDBPath
+			}
+
+			configLoaded = cfg
+			return nil
+		},
+	}
+
+	// Global flags
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./config.yaml)")
+	rootCmd.PersistentFlags().StringVar(&slowLogDir, "slow-log-dir", "", "directory containing slow log files")
+	rootCmd.PersistentFlags().StringVar(&duckDBPath, "duck-db-path", "", "path to DuckDB database file")
+
+	// Add commands
+	rootCmd.AddCommand(parseCmd())
+	rootCmd.AddCommand(statsCmd())
 	rootCmd.AddCommand(queryCmd())
 	rootCmd.AddCommand(digestCmd())
 	rootCmd.AddCommand(versionCmd())
+	rootCmd.AddCommand(serveCmd())
+
+	return rootCmd
+}
+
+func main() {
+	if err := newRootCmd().Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
 ```
+
+Everything else in `main.go` is untouched: `parseCmd`, `statsCmd`, `queryCmd`,
+`versionCmd`, `serveCmd`, and `buildServeRouter` keep their current bodies.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -3137,10 +3549,11 @@ and must not drift:
 | Deviations from pt-query-digest | §1 deviations table |
 | `--order-by` attributes and aggregates | §1 two mapping tables |
 | `--group-by` values, aliases, and the `tables` fan-out caveat | §1 group table + fan-out paragraph |
-| `--filter` grammar | §2 key/operator table + the multi-value, `rows_sent`, and shell-quoting notes |
+| `--filter` grammar | §2 key/operator table + the multi-value, single-value-`table`, empty-value, `rows_sent`, and shell-quoting notes |
 | `--since` / `--until` | §3 in full, including the local-timezone rationale |
 | Report columns and what V/M means | §4 profile table + per-class detail bullets |
-| JSON schema | §6 example, verbatim |
+| How the representative row is chosen | §4 "The representative row" subsection |
+| JSON schema and numeric precision | §6 example plus the 2^53 precision note |
 | Known limits | §14 out-of-scope list |
 
 Open with a two-sentence statement of what the command is for, and add this
@@ -3167,26 +3580,33 @@ a `### digest` section containing the same three commands as Step 4's worked
 example, one sentence noting that output is markdown unless `--json` is passed,
 and a pointer to `docs/README_DIGEST.md`.
 
-- [ ] **Step 6: Wire the gate into CI**
+- [ ] **Step 6: Wire the gate into CI, scoped to this branch**
 
-Add a new job to `.github/workflows/ci.yml`. It needs full history, so it uses
-`fetch-depth: 0` exactly as the existing `gitleaks` job (line ~102) does:
+Add a job to `.github/workflows/ci.yml`. `actions/checkout` with `fetch-depth: 0`
+already fetches full history for all branches, so no extra `git fetch` is needed
+— and `git fetch --depth=0` would fail outright with
+`fatal: depth 0 is not a positive number` (verified). No `setup-go` step is
+needed either; the script is pure git.
+
+The `branches` filter is what keeps this **branch-scoped rather than permanent
+policy**. As standing policy the job would block every future `pkg/` change,
+contradicting CLAUDE.md's rule that such changes are legitimate versioned events
+(additive = minor, breaking = major).
 
 ```yaml
   pkg-locked:
     name: pkg-locked
+    # Scoped to the digest work: proves THIS feature stayed out of pkg/.
+    # Delete this job when the feature merges -- see Step 9.
+    if: startsWith(github.head_ref, 'feat/digest')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Assert pkg/ is unchanged
-        run: |
-          git fetch origin "${{ github.base_ref || 'main' }}" --depth=0
-          ./scripts/check-pkg-locked.sh "origin/${{ github.base_ref || 'main' }}"
+        run: ./scripts/check-pkg-locked.sh "origin/${{ github.base_ref || 'main' }}"
 ```
-
-No `setup-go` step is needed — the script is pure git.
 
 - [ ] **Step 7: Commit**
 
@@ -3212,6 +3632,14 @@ Then, in `gofast-enterprise` (a separate repo, tracked as follow-up work — **n
 
 Note that step 2 is functionally a no-op on its own: `digest` lives in `internal/`, so enterprise cannot import it. Step 1 is what actually delivers the feature there.
 
+- [ ] **Step 9: Remove the branch-scoped CI gate**
+
+Once this work merges, delete the `pkg-locked` job from
+`.github/workflows/ci.yml`. It exists to prove *this* feature stayed out of
+`pkg/`, not to freeze `pkg/` forever — CLAUDE.md permits `pkg/` changes as
+versioned events. `scripts/check-pkg-locked.sh` stays in the repo for manual use
+and remains referenced from the verification checklist.
+
 ---
 
 ## Verification Checklist
@@ -3227,8 +3655,12 @@ Before declaring the feature complete, run every command and read its output:
 - [ ] `git diff --stat origin/main...HEAD -- pkg/` — empty
 - [ ] `gitleaks detect --no-git` — no findings
 - [ ] `./bin/gofast-cli digest --json | jq .` against a real store — parses
-- [ ] `git diff origin/main...HEAD -- cmd/cli/main.go` — shows **only** the added
-      `rootCmd.AddCommand(digestCmd())` line, proving `query`, `parse`, `stats`
-      and `serve` are untouched
+- [ ] `git diff origin/main...HEAD -- cmd/cli/main.go` — shows **only** the
+      `main()` → `newRootCmd()` extraction plus the added
+      `rootCmd.AddCommand(digestCmd())` line. The bodies of `parseCmd`,
+      `statsCmd`, `queryCmd`, `versionCmd`, `serveCmd` and `buildServeRouter`
+      must be untouched.
 - [ ] `./bin/gofast-cli query "select 1"` — output identical to the same command
       run from `origin/main`
+- [ ] `./bin/gofast-cli digest --json --order-by bogus 2>/dev/null` — stdout is
+      completely empty (diagnostics went to stderr)

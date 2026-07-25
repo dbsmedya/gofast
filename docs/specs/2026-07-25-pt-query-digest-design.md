@@ -174,14 +174,29 @@ Keys and operators map **exactly** onto what `RecordFilter` already models, so
 | `host` | `=` | `Hosts` (IN) |
 | `db` | `=` | `DBs` (IN) |
 | `source_host` | `=` | `SourceHosts` (IN) |
-| `table` (alias `tables`) | `=` | `Tables` (`list_contains`) |
+| `table` (alias `tables`) | `=` | `Tables` (`list_contains`) — **single value only** |
 | `query_time` | `>` `<` | `QueryTimeGT` / `QueryTimeLT` |
 | `lock_time` | `>` `<` | `LockTimeGT` / `LockTimeLT` |
 | `rows_examined` | `>` | `RowsExaminedGT` |
 
-- **Multi-value equality:** repeat the flag (`--filter "user = root" --filter
-  "user = app"`) or use a comma list (`--filter "user = root,app"`). Both
-  accumulate into one `IN (…)`.
+- **Multi-value equality** applies to `user`, `host`, `db`, and `source_host`
+  only: repeat the flag (`--filter "user = root" --filter "user = app"`) or use
+  a comma list (`--filter "user = root,app"`). Both accumulate into one
+  `IN (…)`, so they mean **either**.
+- **`table` accepts exactly one value.** A comma list or a repeated `table`
+  filter is an error naming `--group-by tables` as the way to get a per-table
+  breakdown.
+
+  This is not an arbitrary restriction. `RecordFilter.BuildWhere()` renders each
+  table value as its own `list_contains` predicate and joins all predicates with
+  `AND` (`pkg/storage/records.go:104`), so `table = orders,customers` would mean
+  "touches **both**" — verified against DuckDB — while the identical comma
+  syntax on `user` means "**either**". Rather than ship two silently opposite
+  meanings for one syntax, or hand-roll an OR predicate that no longer delegates
+  to the audited `BuildWhere()`, multi-value table filters are rejected outright.
+
+- **Empty values are rejected.** `--filter "user ="` and `--filter "user = ,"`
+  both error rather than silently producing an unfiltered run.
 - **Numeric keys:** repeating the same key+op overwrites (last wins), because
   `RecordFilter` holds a single bound per comparison.
 - **`rows_sent` is not a filter key.** It is reported but not filterable —
@@ -247,6 +262,29 @@ for non-fingerprint groupings — under `--group-by user`, `Query ID` is the
 username and `Item` shows what that user predominantly runs, which is more
 informative than repeating the key.
 
+### The representative row
+
+`Item` and `sample_sql` describe *one* query, so they must come from one row.
+The selection rule is explicit and deterministic:
+
+1. Within each group, rank fingerprints by call count, descending; ties break on
+   `fingerprint_id` ascending.
+2. Take the winning fingerprint — the query the group runs most often.
+3. From that fingerprint's rows, take the **slowest** one
+   (`arg_max(..., query_time_sec)`), so the sample shown is its worst instance.
+
+All three representative fields (`sample_sql`, `sanitized_sql`, `tables`) are
+drawn from that single row. `ANY_VALUE` is deliberately **not** used: three
+independent `ANY_VALUE` calls carry no guarantee of agreeing on a row, so `Item`
+could be distilled from one row's `sanitized_sql` combined with another row's
+`tables`. In practice DuckDB happened to correlate them in testing, which makes
+this a latent rather than visible defect — exactly the kind that appears later
+under parallel aggregation on a large store.
+
+For `--group-by fingerprint` step 1 is a no-op (the group *is* the fingerprint),
+so the rule degenerates to "the slowest instance of this query", which is what a
+digest should show anyway.
+
 ### Per-class detail
 
 Columns `pct, total, min, max, avg, 95%, stddev, median` for each attribute.
@@ -263,7 +301,7 @@ Columns `pct, total, min, max, avg, 95%, stddev, median` for each attribute.
   `var_samp` return NULL; these are coerced to `0`, making V/M `0` as well.
 - If a global attribute sum is `0`, `pct` is `0` (no division by zero).
 
-## 5. SQL design — three passes
+## 5. SQL design — four passes
 
 All passes run against the `slow_logs_with_source` view and share one
 `RecordFilter.BuildWhere()` result (clause text + bound args).
@@ -282,9 +320,14 @@ FROM slow_logs_with_source <where>
 SELECT <group_col> AS grp, COUNT(*) AS calls, <agg>(<attr>) AS rank_val
 FROM slow_logs_with_source <where>
 GROUP BY grp
-ORDER BY rank_val DESC
+ORDER BY rank_val DESC, grp ASC
 LIMIT ?
 ```
+
+The `grp ASC` secondary sort is required, not cosmetic: ties on `rank_val` are
+common (two queries with identical total time, or any `--order-by` on a
+low-cardinality attribute), and with `LIMIT` a tie at the boundary would
+otherwise decide *which classes appear at all* nondeterministically.
 
 **Pass 3 — statistics**, restricted to the group keys pass 2 returned:
 
@@ -299,17 +342,48 @@ SELECT <group_col> AS grp,
        -- median) for lock_time_sec, rows_sent, and rows_examined.
        -- var_samp is computed for query_time_sec only, since V/M is
        -- defined over response time.
-       ANY_VALUE(sample_sql), ANY_VALUE(sanitized_sql), ANY_VALUE(tables)
 FROM slow_logs_with_source
 <where> AND <group_col> IN (?, ?, …)
 GROUP BY grp
 ```
 
-**Why three passes rather than one:** the motivating case is a large DuckDB file
-on a collector. A single pass would compute percentiles and standard deviations
-for every group in the table — potentially millions of fingerprints — to display
-20. Pass 2 narrows to N first, so the expensive per-group sorting in pass 3 runs
-over N groups only.
+**Pass 4 — representative rows**, also restricted to the ranked keys. It
+implements the selection rule above: aggregate per (group, fingerprint), then
+keep the highest-count fingerprint per group.
+
+```sql
+WITH per_fp AS (
+  SELECT <group_col> AS grp,
+         fingerprint_id,
+         COUNT(*) AS fp_calls,
+         arg_max(sample_sql,    query_time_sec) AS sample_sql,
+         arg_max(sanitized_sql, query_time_sec) AS sanitized_sql,
+         arg_max(tables,        query_time_sec) AS tables
+  FROM slow_logs_with_source
+  <where> AND <group_col> IN (?, ?, …)
+  GROUP BY grp, fingerprint_id
+),
+ranked AS (
+  SELECT *, ROW_NUMBER() OVER (
+             PARTITION BY grp
+             ORDER BY fp_calls DESC, fingerprint_id ASC) AS rn
+  FROM per_fp
+)
+SELECT grp, sample_sql, sanitized_sql, tables FROM ranked WHERE rn = 1
+```
+
+The three `arg_max` calls share one ordering expression, so they resolve to the
+same row. Verified against DuckDB for both `VARCHAR` and `VARCHAR[]`.
+
+Pass 4 is separate from pass 3 because the two work at different grains — pass 3
+groups by `grp`, pass 4 by `(grp, fingerprint_id)` — and it is cheap: both are
+already restricted to at most `--limit` group keys.
+
+**Why several passes rather than one:** the motivating case is a large DuckDB
+file on a collector. A single pass would compute percentiles and standard
+deviations for every group in the table — potentially millions of fingerprints —
+to display 20. Pass 2 narrows to N first, so the expensive per-group sorting in
+passes 3 and 4 runs over N groups only.
 
 ### Injection safety
 
@@ -368,8 +442,18 @@ hard requirement and gets its own test.
 }
 ```
 
-Numbers are raw — seconds as floats, counts as integers, no unit suffixes and no
-human formatting. Formatting is a markdown concern.
+Numbers are raw — no unit suffixes and no human formatting. Formatting is a
+markdown concern.
+
+**Numeric precision.** `total.calls` is an exact integer (`COUNT(*)`). Every
+other numeric field is a float64, because all SQL aggregates are cast to
+`DOUBLE` — a uniform rule that exists because `SUM` over a `UBIGINT` column
+(`rows_sent`, `rows_examined`) otherwise returns a `*big.Int` to Go. The
+consequence is that row-count sums lose exact integer precision above 2^53
+(9,007,199,254,740,992). This is accepted rather than special-cased: reaching it
+requires summing nine quadrillion examined rows within a single class, and the
+alternative reintroduces `*big.Int` handling plus a second cast rule. Recorded
+under known limits.
 
 ## 7. Output — markdown (default)
 
@@ -426,13 +510,16 @@ All are reported before any query runs:
 - `internal/digest/options.go` — `Options`, allow-lists, validation.
 - `internal/digest/filter.go` — `--filter`/`--since`/`--until` parsing →
   `storage.RecordFilter`.
-- `internal/digest/sql.go` — the three SQL builders.
+- `internal/digest/sql.go` — the four SQL builders.
 - `internal/digest/run.go` — executes the passes, assembles the typed `Report`.
 - `internal/digest/report.go` — `Report`, `Class`, `Stats`, `Totals` types with
   JSON tags.
 - `cmd/cli/digest.go` — cobra command, flags → `digest.Options`.
 - `cmd/cli/digest_render.go` — markdown and JSON renderers.
-- `cmd/cli/main.go` — one added `rootCmd.AddCommand(digestCmd())` line.
+- `cmd/cli/main.go` — extract the existing root-command construction into
+  `newRootCmd()` so tests can execute the real command tree, and register
+  `digestCmd()`. `main()` becomes `newRootCmd().Execute()` plus its existing
+  error handling; no command's behavior changes.
 
 ## 11. Testing (TDD)
 
@@ -450,8 +537,10 @@ Tests are written before the code they cover.
 5. **`--group-by tables`** — a row touching N tables lands in N groups; a
    NULL/empty `tables` row appears in none; a `table=` filter composes.
 6. **Filter parsing** — spaced and unspaced forms; repeat and comma both produce
-   `IN`; numeric bounds; unknown key, unsupported key/op, and `rows_sent`
-   (explicitly unsupported) each error.
+   `IN` for `user`/`host`/`db`/`source_host`; numeric bounds; unknown key,
+   unsupported key/op, and `rows_sent` (explicitly unsupported) each error.
+   A multi-value `table` filter errors in both the comma and repeated forms.
+   An empty or comma-only value errors rather than running unfiltered.
 7. **Time bounds** — relative `N[shmd]` and absolute forms; MySQL-expression form
    rejected; `--since` after `--until` rejected.
 8. **Limit** — pass 2 narrows before pass 3; fewer groups than `--limit` is fine.
@@ -461,26 +550,44 @@ Tests are written before the code they cover.
 10. **Empty result** — zeroed totals, no classes, no error.
 11. **Injection** — `--filter "db=x'; DROP TABLE slow_logs;--"` binds as a value,
     matches nothing, and leaves `slow_logs` intact.
+12. **Representative row is one row** — a group whose most-frequent fingerprint
+    differs from its slowest query yields `Item`, `sanitized_sql`, and `tables`
+    all drawn from the most-frequent fingerprint, and `sample_sql` from that
+    fingerprint's slowest instance. A cross-row mixture fails the test.
+13. **Tie determinism** — two groups with identical `rank_val` return in a
+    stable order across repeated runs, and `--limit 1` selects the same one
+    every time.
 
 **`cmd/cli`**, following the existing `serve_test.go` pattern:
 
-12. **`--json` stdout is pure JSON** — parses with `encoding/json` with no
+14. **`--json` stdout is pure JSON** — parses with `encoding/json` with no
     preamble; a warning-producing run still yields parseable stdout.
-13. **Markdown** — profile and per-class tables render; sample SQL is fenced and
+15. **Markdown** — profile and per-class tables render; sample SQL is fenced and
     untruncated.
-14. **Exit codes** — empty result exits `0`; missing store exits `1` with empty
+16. **Exit codes** — empty result exits `0`; missing store exits `1` with empty
     stdout.
-15. **`query` is unchanged** — its existing output is byte-for-byte identical.
+17. **End-to-end through the root command** — the digest is reachable as a
+    registered subcommand (not merely by calling its helper directly), flags
+    parse, and output lands on the command's writer so it can be captured.
+18. **`query` is unchanged** — its existing output is byte-for-byte identical.
 
 ## 12. API-locked gate
 
-Run in CI and before tagging:
+Run before tagging, and in CI **for this feature branch only**:
 
 - `git diff --stat pkg/` is empty for this change.
 - `scripts/run-contract-check.sh` passes.
 - `pkg/api/openapi.yaml` is unmodified.
 - `CGO_ENABLED=1 go build ./...` and `go test ./...` pass.
 - `gitleaks` passes.
+
+The gate is **branch-scoped, not permanent repository policy**. Its purpose is
+to prove *this* feature stayed out of `pkg/`. As standing policy it would block
+every future `pkg/` change, contradicting the versioning rule in CLAUDE.md that
+treats such changes as legitimate versioned events (additive = minor,
+breaking = major) — turning "change deliberately" into "never change". The CI
+job is removed when this work merges; `scripts/check-pkg-locked.sh` remains for
+manual use.
 
 ## 13. Release and cross-repo follow-ups
 
@@ -503,7 +610,9 @@ delivers the feature there.
 - Multiple `--group-by` values producing multiple reports per run.
 - `--filter` operators beyond what `RecordFilter` models (`!=`, `LIKE`, `OR`,
   `>=`/`<=`, `<` on `rows_examined`).
+- Multi-value `table` filters, in either AND or OR form (see §2).
 - Filtering on `rows_sent` (needs a `pkg/` change).
+- Exact integer precision for row-count sums above 2^53 (see §6).
 - Ascending order.
 - pt-query-digest's `distill` as a `--group-by` value (the `Item` column already
   distills within each class).
