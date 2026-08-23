@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	duckdb "github.com/marcboeker/go-duckdb/v2"
@@ -220,13 +221,28 @@ func (s *Storage) DedupeSlowLogs(ctx context.Context) error {
 	return nil
 }
 
+// validUTF8 coerces s to valid UTF-8, replacing invalid byte sequences with
+// U+FFFD.
+//
+// DuckDB VARCHAR requires valid UTF-8: the appender defers the check to flush
+// and then invalidates the ENTIRE batch, so one bad row costs up to batch_size
+// good rows, aborts the file, and — because resume_offset only advances after a
+// successful insert — poisons every retry. MySQL legitimately writes non-UTF-8
+// bytes into the slow log whenever a query embeds a _binary'...' literal (e.g. a
+// Java serialized object passed into an IN clause), so ingestion must never
+// assume the log is UTF-8. Replacement is deliberately lossy: those bytes are an
+// opaque blob and preserving them is not worth failing the import.
+func validUTF8(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
 func stringsToAny(ss []string) []any {
 	if ss == nil {
 		return []any{}
 	}
 	out := make([]any, len(ss))
 	for i, s := range ss {
-		out[i] = s
+		out[i] = validUTF8(s)
 	}
 	return out
 }
@@ -274,13 +290,13 @@ func (s *Storage) InsertSlowLogBatch(ctx context.Context, entries []*models.Slow
 	for i, entry := range entries {
 		if err := appender.AppendRow(
 			ids[i],
-			fileHash,
-			entry.FingerprintID,
-			entry.SanitizedSQL,
-			entry.SampleSQL,
-			entry.User,
-			entry.Host,
-			entry.DB,
+			validUTF8(fileHash),
+			validUTF8(entry.FingerprintID),
+			validUTF8(entry.SanitizedSQL),
+			validUTF8(entry.SampleSQL),
+			validUTF8(entry.User),
+			validUTF8(entry.Host),
+			validUTF8(entry.DB),
 			entry.QueryTimeSec,
 			entry.LockTimeSec,
 			entry.RowsSent,
@@ -289,7 +305,7 @@ func (s *Storage) InsertSlowLogBatch(ctx context.Context, entries []*models.Slow
 			entry.CreatedAt,
 			stringsToAny(entry.Tables),
 			entry.EventOffset,
-			entry.EventHash,
+			validUTF8(entry.EventHash),
 		); err != nil {
 			_ = appender.Close()
 			return fmt.Errorf("failed to append row %d: %w", i, err)
