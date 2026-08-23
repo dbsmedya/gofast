@@ -56,7 +56,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.12"
+          go-version: "1.25.13"
           cache-dependency-path: go.sum
 
       # DuckDB is linked via cgo; the Linux and macOS runners already ship the

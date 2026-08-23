@@ -2,7 +2,7 @@
 # Multi-stage build for Go API with DuckDB support
 
 # Build stage
-FROM golang:1.25.12-bookworm AS builder
+FROM golang:1.25.13-bookworm AS builder
 
 # Install build dependencies for DuckDB and apply current security updates
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
