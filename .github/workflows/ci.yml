@@ -48,7 +48,7 @@ jobs:
         env:
           CGO_ENABLED: "1"
         with:
-          version: v2.11.4
+          version: v2.15.0
           args: ./...
 
   deadcode:
