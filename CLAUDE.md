@@ -14,7 +14,7 @@ A Go module shipping the parser/storage/fingerprint libraries (`pkg/`) and these
 ## Hard rules
 
 1. **`pkg/` is the public contract.** `pkg/{api,storage,parser,models,config,fingerprint}` is consumed by downstream integrators. Treat exported-signature/behavior changes as versioned events (breaking = major, additive = minor); don't change them casually.
-2. **Build requires `CGO_ENABLED=1`** (DuckDB uses cgo): `CGO_ENABLED=1 go build ./...`. Toolchain **go 1.25.12**.
+2. **Build requires `CGO_ENABLED=1`** (DuckDB uses cgo): `CGO_ENABLED=1 go build ./...`. Toolchain **go 1.27.4**.
 3. **The stable contract is the REST machine API + `config.yaml` schema**, specified by the served OpenAPI (`pkg/api/openapi.yaml`, served at `/api/v1/openapi.json`). `scripts/run-contract-check.sh` must stay green.
 4. **No secrets; `gitleaks` must pass.**
 

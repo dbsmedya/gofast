@@ -80,7 +80,7 @@ missed:
 - **`pkg/` is the public contract.** Exported-signature or behavior changes are
   versioned events (breaking = major, additive = minor). Don't change it
   casually.
-- **Build requires `CGO_ENABLED=1`** (DuckDB uses cgo). Toolchain **go 1.25.12**.
+- **Build requires `CGO_ENABLED=1`** (DuckDB uses cgo). Toolchain **go 1.27.4**.
 - **The stable contract is the REST machine API + `config.yaml` schema**,
   specified by `pkg/api/openapi.yaml`. `scripts/run-contract-check.sh` must stay
   green.
