@@ -2,7 +2,7 @@
 # Multi-stage build for Go API with DuckDB support
 
 # Build stage
-FROM golang:1.25.13-bookworm AS builder
+FROM golang:1.27.4-bookworm AS builder
 
 # Install build dependencies for DuckDB and apply current security updates
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ WORKDIR /build
 
 # Copy go mod files first for better caching
 COPY go.mod go.sum ./
-# Base image now matches go.mod's toolchain (1.25.12) — pin to it, no network fetch.
+# Base image now matches go.mod's toolchain (1.27.4) — pin to it, no network fetch.
 ENV GOTOOLCHAIN=local
 RUN go mod download
 
@@ -26,7 +26,7 @@ COPY . ./
 # Build the API binary with CGO enabled (required for DuckDB)
 ENV CGO_ENABLED=1
 ENV GOOS=linux
-# Base image now matches go.mod's toolchain (1.25.12) — pin to it, no network fetch.
+# Base image now matches go.mod's toolchain (1.27.4) — pin to it, no network fetch.
 ENV GOTOOLCHAIN=local
 RUN go env GOTOOLCHAIN
 # Build the CLI binary (parse/stats/query + the read-only machine API `serve`)

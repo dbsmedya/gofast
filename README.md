@@ -1,6 +1,6 @@
 # GoFast — MySQL Slow Log Analyzer
 
-[![Go Version](https://img.shields.io/badge/go-1.25.12-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/go-1.27.4-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Parse MySQL slow logs into DuckDB and report on them with a
@@ -80,7 +80,7 @@ events.
 
 ### Prerequisites
 
-- Go **1.25.12** or higher
+- Go **1.27.4** or higher
 - A C compiler — DuckDB uses cgo, so `CGO_ENABLED=1` is required
 
 ### From source
